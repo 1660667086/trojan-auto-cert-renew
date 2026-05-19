@@ -105,6 +105,18 @@ SERVICE_STOP_LIST="trojan" bash install.sh
 /etc/cron.d/trojan-auto-cert-renew
 ```
 
+到期时间默认按北京时间显示：
+
+```text
+2026 年 6 月 5 日 07:59:59
+```
+
+需要改时区可以安装时指定：
+
+```bash
+DISPLAY_TZ=Asia/Shanghai bash install.sh
+```
+
 ## 自动识别规则
 
 脚本会按顺序查找域名：

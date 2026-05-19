@@ -17,6 +17,7 @@ CONFIG_PATH="${CONFIG_PATH:-}"
 DOMAIN="${DOMAIN:-}"
 TROJAN_CLI="${TROJAN_CLI:-}"
 CERT_CHOICE="${CERT_CHOICE:-1}"
+DISPLAY_TZ="${DISPLAY_TZ:-Asia/Shanghai}"
 
 usage() {
     cat <<'USAGE'
@@ -35,6 +36,7 @@ Environment variables:
   DOMAIN=www.example.com
   TROJAN_CLI=/usr/local/bin/trojan
   CERT_CHOICE=1
+  DISPLAY_TZ=Asia/Shanghai
   RAW_BASE=https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main
 USAGE
 }
@@ -118,6 +120,7 @@ install_cron() {
     cmd="${cmd} DISABLE_ACME_CRON=$(shell_quote "$DISABLE_ACME_CRON")"
     cmd="${cmd} SERVICE_STOP_LIST=$(shell_quote "$SERVICE_STOP_LIST")"
     cmd="${cmd} CERT_CHOICE=$(shell_quote "$CERT_CHOICE")"
+    cmd="${cmd} DISPLAY_TZ=$(shell_quote "$DISPLAY_TZ")"
     [ -n "$CONFIG_PATH" ] && cmd="${cmd} CONFIG_PATH=$(shell_quote "$CONFIG_PATH")"
     [ -n "$DOMAIN" ] && cmd="${cmd} DOMAIN=$(shell_quote "$DOMAIN")"
     [ -n "$TROJAN_CLI" ] && cmd="${cmd} TROJAN_CLI=$(shell_quote "$TROJAN_CLI")"

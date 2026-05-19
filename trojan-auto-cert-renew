@@ -12,6 +12,7 @@ BACKUP_DIR="${BACKUP_DIR:-/root/trojan-cert-backups}"
 CERT_CHOICE="${CERT_CHOICE:-1}"
 DISABLE_ACME_CRON="${DISABLE_ACME_CRON:-1}"
 SERVICE_STOP_LIST="${SERVICE_STOP_LIST:-trojan trojan-go nginx caddy apache2 httpd cloudreve}"
+DISPLAY_TZ="${DISPLAY_TZ:-Asia/Shanghai}"
 
 FORCE=0
 DRY_RUN=0
@@ -29,6 +30,7 @@ Environment variables:
   DOMAIN=www.example.com
   TROJAN_CLI=/usr/local/bin/trojan
   RENEW_DAYS=7
+  DISPLAY_TZ=Asia/Shanghai
   SERVICE_STOP_LIST="trojan nginx cloudreve"
   CERT_CHOICE=1
 
@@ -239,6 +241,18 @@ cert_end_date() {
     openssl x509 -in "$cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//'
 }
 
+format_cert_date() {
+    local raw="$1"
+    [ -n "$raw" ] || return 0
+
+    if command -v date >/dev/null 2>&1; then
+        TZ="$DISPLAY_TZ" date -d "$raw" '+%Y 年 %-m 月 %-d 日 %H:%M:%S' 2>/dev/null && return 0
+        TZ="$DISPLAY_TZ" date -j -f '%b %e %T %Y %Z' "$raw" '+%Y 年 %-m 月 %-d 日 %H:%M:%S' 2>/dev/null && return 0
+    fi
+
+    printf '%s\n' "$raw"
+}
+
 cert_subject() {
     local cert="$1"
     [ -n "$cert" ] && [ -s "$cert" ] || return 0
@@ -285,7 +299,7 @@ print_status_report() {
         fi
         [ -n "$subject" ] && log "证书主体: $subject"
         [ -n "$issuer" ] && log "签发机构: $issuer"
-        [ -n "$end_date" ] && log "到期时间: $end_date"
+        [ -n "$end_date" ] && log "到期时间: $(format_cert_date "$end_date")"
         return 0
     fi
 
@@ -433,7 +447,7 @@ main() {
 
     if [ "$FORCE" != "1" ] && cert_is_fresh "$cert"; then
         end_date="$(cert_end_date "$cert")"
-        log "Certificate is valid beyond ${RENEW_DAYS} days, expires: ${end_date}. Skip."
+        log "Certificate is valid beyond ${RENEW_DAYS} days, expires: $(format_cert_date "$end_date"). Skip."
         disable_acme_cron
         exit 0
     fi
@@ -464,7 +478,7 @@ main() {
     validate_cert_files "$cert" "$key" || fail_with_restore "$backup" "new certificate/key validation failed"
 
     end_date="$(cert_end_date "$cert")"
-    log "Certificate renewal finished successfully, new expiry: ${end_date}"
+    log "Certificate renewal finished successfully, new expiry: $(format_cert_date "$end_date")"
     disable_acme_cron
 }
 
