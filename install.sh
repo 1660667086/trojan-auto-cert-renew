@@ -18,6 +18,7 @@ DOMAIN="${DOMAIN:-}"
 TROJAN_CLI="${TROJAN_CLI:-}"
 CERT_CHOICE="${CERT_CHOICE:-1}"
 DISPLAY_TZ="${DISPLAY_TZ:-Asia/Shanghai}"
+FIX_APT_ARCHIVE="${FIX_APT_ARCHIVE:-0}"
 
 usage() {
     cat <<'USAGE'
@@ -37,7 +38,11 @@ Environment variables:
   TROJAN_CLI=/usr/local/bin/trojan
   CERT_CHOICE=1
   DISPLAY_TZ=Asia/Shanghai
+  FIX_APT_ARCHIVE=0
   RAW_BASE=https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main
+
+For Debian 10 buster with expired mirror sources:
+  curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/install.sh | FIX_APT_ARCHIVE=1 bash
 USAGE
 }
 
@@ -58,6 +63,60 @@ has_cmd() {
     command -v "$1" >/dev/null 2>&1
 }
 
+os_codename() {
+    if [ -r /etc/os-release ]; then
+        . /etc/os-release
+        printf '%s' "${VERSION_CODENAME:-}"
+    fi
+}
+
+configure_debian_buster_archive() {
+    local codename backup_dir file
+    codename="$(os_codename)"
+    [ "$codename" = "buster" ] || die "FIX_APT_ARCHIVE=1 only supports Debian 10 buster; detected: ${codename:-unknown}"
+
+    backup_dir="/root/apt-sources-backup-$(date '+%Y%m%d%H%M%S')"
+    mkdir -p "$backup_dir"
+
+    [ -f /etc/apt/sources.list ] && cp -a /etc/apt/sources.list "$backup_dir/sources.list"
+    if [ -d /etc/apt/sources.list.d ]; then
+        cp -a /etc/apt/sources.list.d "$backup_dir/sources.list.d" 2>/dev/null || true
+    fi
+
+    log "Backing up APT sources to $backup_dir"
+    for file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        [ -f "$file" ] || continue
+        sed -i.bak '/buster/ s/^/# disabled by trojan-auto-cert: /' "$file"
+    done
+
+    cat > /etc/apt/sources.list.d/debian-buster-archive.list <<'EOF'
+deb http://archive.debian.org/debian buster main contrib non-free
+deb http://archive.debian.org/debian buster-updates main contrib non-free
+deb http://archive.debian.org/debian-security buster/updates main contrib non-free
+EOF
+
+    cat > /etc/apt/apt.conf.d/99trojan-auto-cert-archive <<'EOF'
+Acquire::Check-Valid-Until "false";
+EOF
+
+    log "Switched Debian buster APT sources to archive.debian.org"
+}
+
+apt_update_or_fix() {
+    if apt-get update; then
+        return 0
+    fi
+
+    if [ "$FIX_APT_ARCHIVE" = "1" ]; then
+        log "apt-get update failed; trying Debian buster archive source fix..."
+        configure_debian_buster_archive
+        apt-get update
+        return 0
+    fi
+
+    die "apt-get update failed. If this is Debian 10 buster, rerun with: curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/install.sh | FIX_APT_ARCHIVE=1 bash"
+}
+
 install_packages() {
     local packages=()
     local p
@@ -74,7 +133,7 @@ install_packages() {
 
     log "Installing dependencies: ${packages[*]}"
     if has_cmd apt-get; then
-        apt-get update
+        apt_update_or_fix
         DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
     elif has_cmd dnf; then
         dnf install -y "${packages[@]}"

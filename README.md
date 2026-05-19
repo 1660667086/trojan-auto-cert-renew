@@ -171,3 +171,23 @@ DISABLE_ACME_CRON=0 bash install.sh
 ```bash
 bash uninstall.sh
 ```
+
+## Debian 10 源过期
+
+如果安装时出现类似：
+
+```text
+The repository 'http://mirrors.cloud.aliyuncs.com/debian buster Release' no longer has a Release file
+```
+
+说明这台机器是 Debian 10 `buster`，普通镜像源已经过期。可以让安装器先备份并切换到 Debian 官方归档源：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/install.sh | FIX_APT_ARCHIVE=1 bash
+```
+
+原 apt 源会备份到：
+
+```text
+/root/apt-sources-backup-时间/
+```
