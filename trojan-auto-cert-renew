@@ -15,13 +15,14 @@ SERVICE_STOP_LIST="${SERVICE_STOP_LIST:-trojan trojan-go nginx caddy apache2 htt
 
 FORCE=0
 DRY_RUN=0
+STATUS=0
 STARTED_SERVICES=()
 TROJAN_WEB_WAS_ACTIVE=0
 
 usage() {
     cat <<'USAGE'
 Usage:
-  trojan-auto-cert-renew [--force] [--dry-run]
+  trojan-auto-cert-renew [--force] [--dry-run] [--status]
 
 Environment variables:
   CONFIG_PATH=/usr/local/etc/trojan/config.json
@@ -45,6 +46,9 @@ while [ "$#" -gt 0 ]; do
             ;;
         --dry-run|dry-run)
             DRY_RUN=1
+            ;;
+        --status|status)
+            STATUS=1
             ;;
         --help|-h)
             usage
@@ -235,6 +239,18 @@ cert_end_date() {
     openssl x509 -in "$cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//'
 }
 
+cert_subject() {
+    local cert="$1"
+    [ -n "$cert" ] && [ -s "$cert" ] || return 0
+    openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed 's/^subject= *//'
+}
+
+cert_issuer() {
+    local cert="$1"
+    [ -n "$cert" ] && [ -s "$cert" ] || return 0
+    openssl x509 -in "$cert" -noout -issuer 2>/dev/null | sed 's/^issuer= *//'
+}
+
 validate_cert_files() {
     local cert="$1"
     local key="$2"
@@ -243,6 +259,39 @@ validate_cert_files() {
     openssl x509 -in "$cert" -noout >/dev/null 2>&1 || return 1
     openssl pkey -in "$key" -noout >/dev/null 2>&1 || return 1
     openssl x509 -in "$cert" -noout -checkend 86400 >/dev/null 2>&1 || return 1
+}
+
+print_status_report() {
+    local cert="$1"
+    local key="$2"
+    local end_date subject issuer
+
+    log "[OK] 自动续签脚本可读取 Trojan 配置"
+    log "域名: $DOMAIN"
+    log "配置文件: $CONFIG_PATH"
+    log "Trojan 命令: $TROJAN_CLI"
+    log "证书文件: ${cert:-未配置}"
+    log "私钥文件: ${key:-未配置}"
+
+    if validate_cert_files "$cert" "$key"; then
+        end_date="$(cert_end_date "$cert")"
+        subject="$(cert_subject "$cert")"
+        issuer="$(cert_issuer "$cert")"
+
+        if cert_is_fresh "$cert"; then
+            log "[OK] 证书已安装且有效"
+        else
+            log "[WARN] 证书已安装，但会在 ${RENEW_DAYS} 天内过期"
+        fi
+        [ -n "$subject" ] && log "证书主体: $subject"
+        [ -n "$issuer" ] && log "签发机构: $issuer"
+        [ -n "$end_date" ] && log "到期时间: $end_date"
+        return 0
+    fi
+
+    log "[WARN] 未检测到有效证书或私钥"
+    log "可以运行: $0 --force"
+    return 1
 }
 
 disable_acme_cron() {
@@ -371,7 +420,13 @@ main() {
     log "Detected Trojan CLI: $TROJAN_CLI"
     log "Configured cert: ${cert:-unknown}"
 
+    if [ "$STATUS" = "1" ]; then
+        print_status_report "$cert" "$key"
+        exit $?
+    fi
+
     if [ "$DRY_RUN" = "1" ]; then
+        print_status_report "$cert" "$key" || true
         log "Dry run finished."
         exit 0
     fi

@@ -43,7 +43,29 @@ bash install.sh
 
 默认每天 `04:17` 检查一次。
 
+安装完成后会直接打印：
+
+```text
+[OK] 安装成功
+[OK] 定时任务已安装
+[OK] 证书已安装且有效
+到期时间: ...
+```
+
+如果当前服务器还没有有效证书，会提示：
+
+```text
+[WARN] 安装已完成，但当前没有检测到有效证书
+需要立即申请/测试时运行: /usr/local/sbin/trojan-auto-cert-renew --force
+```
+
 ## 手动测试
+
+查看安装和证书状态：
+
+```bash
+/usr/local/sbin/trojan-auto-cert-renew --status
+```
 
 只检测自动识别是否正常，不申请证书：
 

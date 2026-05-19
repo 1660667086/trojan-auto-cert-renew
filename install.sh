@@ -132,6 +132,17 @@ EOF
     log "Installed cron: $CRON_FILE"
 }
 
+print_install_result() {
+    log "[OK] 安装成功: $INSTALL_PATH"
+
+    if [ -f "$CRON_FILE" ] && grep -q "$INSTALL_PATH" "$CRON_FILE"; then
+        log "[OK] 定时任务已安装: $CRON_FILE"
+        log "自动检查时间: 每天 ${CHECK_HOUR}:${CHECK_MINUTE}"
+    else
+        die "cron install failed: $CRON_FILE"
+    fi
+}
+
 main() {
     case "${1:-}" in
         --help|-h)
@@ -144,13 +155,20 @@ main() {
     install_packages
     install_script
     install_cron
+    print_install_result
 
     if [ "$RUN_CHECK" = "1" ]; then
-        log "Running detection check..."
-        "$INSTALL_PATH" --dry-run
+        log "正在检查证书状态..."
+        if "$INSTALL_PATH" --status; then
+            log "[OK] 证书检测成功"
+        else
+            log "[WARN] 安装已完成，但当前没有检测到有效证书"
+            log "需要立即申请/测试时运行: ${INSTALL_PATH} --force"
+        fi
     fi
 
-    log "Done. Manual test command: ${INSTALL_PATH} --force"
+    log "完成。手动状态检查: ${INSTALL_PATH} --status"
+    log "手动强制续签: ${INSTALL_PATH} --force"
 }
 
 main "$@"
