@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export LC_ALL=C
+export LANG=C
+
+CONFIG_PATH="${CONFIG_PATH:-}"
+DOMAIN="${DOMAIN:-}"
+TROJAN_CLI="${TROJAN_CLI:-}"
+RENEW_DAYS="${RENEW_DAYS:-7}"
+LOG_FILE="${LOG_FILE:-/var/log/trojan-auto-cert-renew.log}"
+BACKUP_DIR="${BACKUP_DIR:-/root/trojan-cert-backups}"
+CERT_CHOICE="${CERT_CHOICE:-1}"
+DISABLE_ACME_CRON="${DISABLE_ACME_CRON:-1}"
+SERVICE_STOP_LIST="${SERVICE_STOP_LIST:-trojan trojan-go nginx caddy apache2 httpd cloudreve}"
+
+FORCE=0
+DRY_RUN=0
+STARTED_SERVICES=()
+TROJAN_WEB_WAS_ACTIVE=0
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  trojan-auto-cert-renew [--force] [--dry-run]
+
+Environment variables:
+  CONFIG_PATH=/usr/local/etc/trojan/config.json
+  DOMAIN=www.example.com
+  TROJAN_CLI=/usr/local/bin/trojan
+  RENEW_DAYS=7
+  SERVICE_STOP_LIST="trojan nginx cloudreve"
+  CERT_CHOICE=1
+
+Default behavior:
+  Detect the Trojan domain, skip if the certificate is valid beyond RENEW_DAYS,
+  otherwise stop active services that may occupy 80/443, run Trojan's own
+  certificate tool, validate the new cert/key, and restore services.
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --force|force)
+            FORCE=1
+            ;;
+        --dry-run|dry-run)
+            DRY_RUN=1
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "[trojan-auto-cert] ERROR: unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+log() {
+    printf '%s %s\n' "$(date '+%F %T')" "$*"
+}
+
+die() {
+    log "ERROR: $*"
+    exit 1
+}
+
+need_root() {
+    [ "$(id -u)" -eq 0 ] || die "please run as root"
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+json_get() {
+    local path="$1"
+    [ -n "$CONFIG_PATH" ] && [ -f "$CONFIG_PATH" ] || return 0
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$CONFIG_PATH" "$path" <<'PY'
+import json
+import sys
+
+config_path, key_path = sys.argv[1], sys.argv[2]
+try:
+    with open(config_path, encoding="utf-8") as f:
+        data = json.load(f)
+    for key in key_path.split("."):
+        if not isinstance(data, dict):
+            data = ""
+            break
+        data = data.get(key, "")
+    print(data if isinstance(data, str) else "")
+except Exception:
+    print("")
+PY
+    elif command -v python >/dev/null 2>&1; then
+        python - "$CONFIG_PATH" "$path" <<'PY'
+import json
+import sys
+
+config_path, key_path = sys.argv[1], sys.argv[2]
+try:
+    with open(config_path) as f:
+        data = json.load(f)
+    for key in key_path.split("."):
+        if not isinstance(data, dict):
+            data = ""
+            break
+        data = data.get(key, "")
+    print(data if isinstance(data, str) else "")
+except Exception:
+    print("")
+PY
+    fi
+}
+
+service_exists() {
+    local svc="$1"
+    local state
+    state="$(systemctl show -p LoadState --value "${svc}.service" 2>/dev/null || true)"
+    [ -n "$state" ] && [ "$state" != "not-found" ]
+}
+
+service_active() {
+    local svc="$1"
+    systemctl is-active --quiet "$svc"
+}
+
+service_text() {
+    local svc
+    for svc in trojan trojan-go; do
+        service_exists "$svc" && systemctl cat "$svc" 2>/dev/null || true
+    done
+}
+
+detect_trojan_cli() {
+    [ -n "$TROJAN_CLI" ] && return 0
+
+    local candidate
+    for candidate in /usr/local/bin/trojan /usr/bin/trojan /usr/bin/trojan/trojan; do
+        if [ -x "$candidate" ]; then
+            TROJAN_CLI="$candidate"
+            return 0
+        fi
+    done
+
+    TROJAN_CLI="$(command -v trojan 2>/dev/null || true)"
+    [ -n "$TROJAN_CLI" ] || die "could not find Trojan management command; set TROJAN_CLI=/path/to/trojan"
+}
+
+detect_config_path() {
+    [ -n "$CONFIG_PATH" ] && return 0
+
+    CONFIG_PATH="$(service_text | awk '
+        match($0, /-config[= ]+[^ ]+/) {
+            s=substr($0, RSTART, RLENGTH)
+            sub(/^-config[= ]+/, "", s)
+            print s
+            exit
+        }')"
+
+    if [ -z "$CONFIG_PATH" ]; then
+        CONFIG_PATH="$(ps -eo args 2>/dev/null | awk '
+            tolower($0) ~ /trojan/ && match($0, /-config[= ]+[^ ]+/) {
+                s=substr($0, RSTART, RLENGTH)
+                sub(/^-config[= ]+/, "", s)
+                print s
+                exit
+            }')"
+    fi
+
+    if [ -z "$CONFIG_PATH" ]; then
+        for candidate in \
+            /usr/local/etc/trojan/config.json \
+            /usr/local/etc/trojan-go/config.json \
+            /etc/trojan/config.json \
+            /etc/trojan-go/config.json; do
+            if [ -f "$candidate" ]; then
+                CONFIG_PATH="$candidate"
+                break
+            fi
+        done
+    fi
+
+    [ -n "$CONFIG_PATH" ] || die "could not detect Trojan config; set CONFIG_PATH=/path/to/config.json"
+    [ -f "$CONFIG_PATH" ] || die "Trojan config not found: $CONFIG_PATH"
+}
+
+domain_from_trojan_info() {
+    TERM=xterm "$TROJAN_CLI" info 2>/dev/null \
+        | sed -E 's/\x1B\[[0-9;]*[mK]//g' \
+        | sed -n 's#.*trojan://[^@]*@\([^:/?#]*\).*#\1#p' \
+        | head -n 1
+}
+
+detect_domain() {
+    [ -n "$DOMAIN" ] && return 0
+
+    local value
+    for path in ssl.sni sni server_name domain host; do
+        value="$(json_get "$path" | tr -d '[:space:]')"
+        if [ -n "$value" ] && ! printf '%s' "$value" | grep -Eq '^(0\.0\.0\.0|127\.0\.0\.1|localhost)$'; then
+            DOMAIN="$value"
+            return 0
+        fi
+    done
+
+    DOMAIN="$(domain_from_trojan_info | tr -d '[:space:]')"
+    [ -n "$DOMAIN" ] || die "could not detect domain from config or 'trojan info'; set DOMAIN=www.example.com"
+}
+
+current_cert_path() {
+    json_get ssl.cert | tr -d '[:space:]'
+}
+
+current_key_path() {
+    json_get ssl.key | tr -d '[:space:]'
+}
+
+cert_is_fresh() {
+    local cert="$1"
+    [ -n "$cert" ] || return 1
+    [ -s "$cert" ] || return 1
+    openssl x509 -in "$cert" -noout -checkend "$((RENEW_DAYS * 86400))" >/dev/null 2>&1
+}
+
+cert_end_date() {
+    local cert="$1"
+    [ -n "$cert" ] && [ -s "$cert" ] || return 0
+    openssl x509 -in "$cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//'
+}
+
+validate_cert_files() {
+    local cert="$1"
+    local key="$2"
+    [ -s "$cert" ] || return 1
+    [ -s "$key" ] || return 1
+    openssl x509 -in "$cert" -noout >/dev/null 2>&1 || return 1
+    openssl pkey -in "$key" -noout >/dev/null 2>&1 || return 1
+    openssl x509 -in "$cert" -noout -checkend 86400 >/dev/null 2>&1 || return 1
+}
+
+disable_acme_cron() {
+    [ "$DISABLE_ACME_CRON" = "1" ] || return 0
+    command -v crontab >/dev/null 2>&1 || return 0
+
+    local tmp
+    tmp="$(mktemp)"
+    crontab -l 2>/dev/null | grep -v '\.acme\.sh.*/acme\.sh --cron' > "$tmp" || true
+    crontab "$tmp" || true
+    rm -f "$tmp"
+}
+
+restore_services() {
+    local i svc
+
+    if [ "${#STARTED_SERVICES[@]}" -gt 0 ]; then
+        log "Restoring services..."
+        for ((i=${#STARTED_SERVICES[@]}-1; i>=0; i--)); do
+            svc="${STARTED_SERVICES[$i]}"
+            log "Starting $svc"
+            systemctl start "$svc" || true
+        done
+    fi
+
+    if [ "$TROJAN_WEB_WAS_ACTIVE" != "1" ] \
+        && service_exists trojan-web \
+        && service_active trojan-web; then
+        log "Stopping trojan-web because it was inactive before renewal"
+        systemctl stop trojan-web || true
+    fi
+}
+
+fail_with_restore() {
+    local backup="$1"
+    shift
+    log "ERROR: $*"
+    if [ -n "$backup" ] && [ -s "$backup" ]; then
+        cp -a "$backup" "$CONFIG_PATH"
+        log "Restored Trojan config from $backup"
+    fi
+    exit 1
+}
+
+stop_active_services() {
+    local svc
+
+    if service_exists trojan-web && service_active trojan-web; then
+        TROJAN_WEB_WAS_ACTIVE=1
+    fi
+
+    for svc in $SERVICE_STOP_LIST; do
+        if service_exists "$svc" && service_active "$svc"; then
+            STARTED_SERVICES+=("$svc")
+        fi
+    done
+
+    for svc in "${STARTED_SERVICES[@]}"; do
+        log "Stopping $svc"
+        systemctl stop "$svc"
+    done
+}
+
+port80_listeners() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -lntp 2>/dev/null | awk '$4 ~ /:80$/ {print}'
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -lntp 2>/dev/null | awk '$4 ~ /:80$/ {print}'
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:80 -sTCP:LISTEN 2>/dev/null || true
+    fi
+}
+
+check_port80_free() {
+    local listeners
+    listeners="$(port80_listeners)"
+    if [ -n "$listeners" ]; then
+        printf '%s\n' "$listeners"
+        return 1
+    fi
+    return 0
+}
+
+run_trojan_tls() {
+    need_cmd expect
+
+    expect <<EXP
+set timeout -1
+set env(TERM) "xterm"
+set domain "$DOMAIN"
+set cert_choice "$CERT_CHOICE"
+spawn "$TROJAN_CLI" tls
+sleep 1
+send "\$cert_choice\r"
+sleep 1
+send -- "\$domain\r"
+expect {
+  eof {
+    catch wait result
+    exit [lindex \$result 3]
+  }
+}
+EXP
+}
+
+main() {
+    need_root
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+    exec > >(tee -a "$LOG_FILE") 2>&1
+
+    need_cmd systemctl
+    need_cmd openssl
+    detect_trojan_cli
+    detect_config_path
+    detect_domain
+
+    [ "$CERT_CHOICE" = "1" ] || die "only CERT_CHOICE=1 (Let's Encrypt) is supported for unattended renewal"
+
+    local cert key end_date backup
+    cert="$(current_cert_path)"
+    key="$(current_key_path)"
+
+    log "Detected domain: $DOMAIN"
+    log "Detected config: $CONFIG_PATH"
+    log "Detected Trojan CLI: $TROJAN_CLI"
+    log "Configured cert: ${cert:-unknown}"
+
+    if [ "$DRY_RUN" = "1" ]; then
+        log "Dry run finished."
+        exit 0
+    fi
+
+    if [ "$FORCE" != "1" ] && cert_is_fresh "$cert"; then
+        end_date="$(cert_end_date "$cert")"
+        log "Certificate is valid beyond ${RENEW_DAYS} days, expires: ${end_date}. Skip."
+        disable_acme_cron
+        exit 0
+    fi
+
+    if [ "$FORCE" = "1" ]; then
+        log "Force mode enabled; renewal will run now."
+    else
+        log "Certificate is missing or expires within ${RENEW_DAYS} days; renewal will run now."
+    fi
+
+    mkdir -p "$BACKUP_DIR"
+    backup="${BACKUP_DIR}/config.json.$(date '+%Y%m%d%H%M%S')"
+    cp -a "$CONFIG_PATH" "$backup"
+    log "Backed up Trojan config to $backup"
+
+    trap 'code=$?; restore_services; exit $code' EXIT
+
+    stop_active_services
+    sleep 2
+    check_port80_free || fail_with_restore "$backup" "port 80 is still occupied after stopping known services"
+
+    log "Running Trojan certificate tool for $DOMAIN"
+    run_trojan_tls || fail_with_restore "$backup" "Trojan certificate tool exited with failure"
+
+    cert="$(current_cert_path)"
+    key="$(current_key_path)"
+    log "Trojan now points to cert: ${cert:-unknown}"
+    validate_cert_files "$cert" "$key" || fail_with_restore "$backup" "new certificate/key validation failed"
+
+    end_date="$(cert_end_date "$cert")"
+    log "Certificate renewal finished successfully, new expiry: ${end_date}"
+    disable_acme_cron
+}
+
+main "$@"
