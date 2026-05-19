@@ -87,10 +87,16 @@ install_packages() {
 
 install_script() {
     local source_dir
+    local script_path
     local tmp
-    source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    script_path="${BASH_SOURCE[0]-}"
+    if [ -n "$script_path" ] && [ -f "$script_path" ]; then
+        source_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    else
+        source_dir=""
+    fi
 
-    if [ -f "${source_dir}/trojan-auto-cert-renew" ]; then
+    if [ -n "$source_dir" ] && [ -f "${source_dir}/trojan-auto-cert-renew" ]; then
         install -m 700 "${source_dir}/trojan-auto-cert-renew" "$INSTALL_PATH"
     else
         has_cmd curl || die "curl is required to fetch trojan-auto-cert-renew"
