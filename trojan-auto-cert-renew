@@ -6,32 +6,37 @@ export LANG=C
 CONFIG_PATH="${CONFIG_PATH:-}"
 DOMAIN="${DOMAIN:-}"
 TROJAN_CLI="${TROJAN_CLI:-}"
+TROJAN_SERVICE="${TROJAN_SERVICE:-}"
 RENEW_DAYS="${RENEW_DAYS:-7}"
 LOG_FILE="${LOG_FILE:-/var/log/trojan-auto-cert-renew.log}"
 BACKUP_DIR="${BACKUP_DIR:-/root/trojan-cert-backups}"
 CERT_CHOICE="${CERT_CHOICE:-1}"
 DISABLE_ACME_CRON="${DISABLE_ACME_CRON:-1}"
 SERVICE_STOP_LIST="${SERVICE_STOP_LIST:-trojan trojan-go nginx caddy apache2 httpd cloudreve}"
+ALWAYS_START_TROJAN="${ALWAYS_START_TROJAN:-1}"
 DISPLAY_TZ="${DISPLAY_TZ:-Asia/Shanghai}"
 
 FORCE=0
 DRY_RUN=0
 STATUS=0
+RECOVER=0
 STARTED_SERVICES=()
 TROJAN_WEB_WAS_ACTIVE=0
 
 usage() {
     cat <<'USAGE'
 Usage:
-  trojan-auto-cert-renew [--force] [--dry-run] [--status]
+  trojan-auto-cert-renew [--force] [--dry-run] [--status] [--recover]
 
 Environment variables:
   CONFIG_PATH=/usr/local/etc/trojan/config.json
   DOMAIN=www.example.com
   TROJAN_CLI=/usr/local/bin/trojan
+  TROJAN_SERVICE=trojan
   RENEW_DAYS=7
   DISPLAY_TZ=Asia/Shanghai
   SERVICE_STOP_LIST="trojan nginx cloudreve"
+  ALWAYS_START_TROJAN=1
   CERT_CHOICE=1
 
 Default behavior:
@@ -51,6 +56,9 @@ while [ "$#" -gt 0 ]; do
             ;;
         --status|status)
             STATUS=1
+            ;;
+        --recover|recover)
+            RECOVER=1
             ;;
         --help|-h)
             usage
@@ -128,12 +136,14 @@ PY
 service_exists() {
     local svc="$1"
     local state
+    svc="${svc%.service}"
     state="$(systemctl show -p LoadState --value "${svc}.service" 2>/dev/null || true)"
     [ -n "$state" ] && [ "$state" != "not-found" ]
 }
 
 service_active() {
     local svc="$1"
+    svc="${svc%.service}"
     systemctl is-active --quiet "$svc"
 }
 
@@ -195,6 +205,37 @@ detect_config_path() {
 
     [ -n "$CONFIG_PATH" ] || die "could not detect Trojan config; set CONFIG_PATH=/path/to/config.json"
     [ -f "$CONFIG_PATH" ] || die "Trojan config not found: $CONFIG_PATH"
+}
+
+trojan_service_candidates() {
+    local svc
+
+    if [ -n "$TROJAN_SERVICE" ]; then
+        for svc in $TROJAN_SERVICE; do
+            printf '%s\n' "${svc%.service}"
+        done
+        return 0
+    fi
+
+    {
+        for svc in trojan trojan-go; do
+            service_exists "$svc" && printf '%s\n' "$svc"
+        done
+
+        systemctl list-units --type=service --all --no-legend 2>/dev/null \
+            | awk '{print $1}'
+        systemctl list-unit-files --type=service --no-legend 2>/dev/null \
+            | awk '{print $1}'
+    } | awk '
+        {
+            svc=$1
+            sub(/\.service$/, "", svc)
+            low=tolower(svc)
+            if (low ~ /^trojan/ && low !~ /(web|ip-limit|limit|panel)/) {
+                print svc
+            }
+        }
+    ' | awk 'NF && !seen[$0]++'
 }
 
 domain_from_trojan_info() {
@@ -337,6 +378,43 @@ restore_services() {
         log "Stopping trojan-web because it was inactive before renewal"
         systemctl stop trojan-web || true
     fi
+
+    if [ "$ALWAYS_START_TROJAN" = "1" ]; then
+        recover_trojan_services || true
+    fi
+}
+
+recover_trojan_services() {
+    local svc found failed
+    found=0
+    failed=0
+
+    while IFS= read -r svc; do
+        [ -n "$svc" ] || continue
+        found=1
+
+        if service_active "$svc"; then
+            log "[OK] Trojan service is running: $svc"
+            continue
+        fi
+
+        log "Starting Trojan service: $svc"
+        systemctl start "$svc" || systemctl restart "$svc" || true
+
+        if service_active "$svc"; then
+            log "[OK] Trojan service started: $svc"
+        else
+            log "[WARN] Trojan service is still not active: $svc"
+            failed=1
+        fi
+    done < <(trojan_service_candidates)
+
+    if [ "$found" = "0" ]; then
+        log "[WARN] No Trojan systemd service detected. Set TROJAN_SERVICE=your-service-name if needed."
+        return 1
+    fi
+
+    return "$failed"
 }
 
 fail_with_restore() {
@@ -351,14 +429,18 @@ fail_with_restore() {
 }
 
 stop_active_services() {
-    local svc
+    local svc existing
 
     if service_exists trojan-web && service_active trojan-web; then
         TROJAN_WEB_WAS_ACTIVE=1
     fi
 
-    for svc in $SERVICE_STOP_LIST; do
+    for svc in $SERVICE_STOP_LIST $(trojan_service_candidates); do
+        svc="${svc%.service}"
         if service_exists "$svc" && service_active "$svc"; then
+            for existing in "${STARTED_SERVICES[@]}"; do
+                [ "$existing" = "$svc" ] && continue 2
+            done
             STARTED_SERVICES+=("$svc")
         fi
     done
@@ -418,6 +500,12 @@ main() {
     exec > >(tee -a "$LOG_FILE") 2>&1
 
     need_cmd systemctl
+
+    if [ "$RECOVER" = "1" ]; then
+        recover_trojan_services
+        exit $?
+    fi
+
     need_cmd openssl
     detect_trojan_cli
     detect_config_path

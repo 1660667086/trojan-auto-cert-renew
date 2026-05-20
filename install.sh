@@ -16,7 +16,9 @@ SERVICE_STOP_LIST="${SERVICE_STOP_LIST:-trojan trojan-go nginx caddy apache2 htt
 CONFIG_PATH="${CONFIG_PATH:-}"
 DOMAIN="${DOMAIN:-}"
 TROJAN_CLI="${TROJAN_CLI:-}"
+TROJAN_SERVICE="${TROJAN_SERVICE:-}"
 CERT_CHOICE="${CERT_CHOICE:-1}"
+ALWAYS_START_TROJAN="${ALWAYS_START_TROJAN:-1}"
 DISPLAY_TZ="${DISPLAY_TZ:-Asia/Shanghai}"
 FIX_APT_ARCHIVE="${FIX_APT_ARCHIVE:-0}"
 
@@ -36,7 +38,9 @@ Environment variables:
   CONFIG_PATH=/usr/local/etc/trojan/config.json
   DOMAIN=www.example.com
   TROJAN_CLI=/usr/local/bin/trojan
+  TROJAN_SERVICE=trojan
   CERT_CHOICE=1
+  ALWAYS_START_TROJAN=1
   DISPLAY_TZ=Asia/Shanghai
   FIX_APT_ARCHIVE=0
   RAW_BASE=https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main
@@ -179,10 +183,12 @@ install_cron() {
     cmd="${cmd} DISABLE_ACME_CRON=$(shell_quote "$DISABLE_ACME_CRON")"
     cmd="${cmd} SERVICE_STOP_LIST=$(shell_quote "$SERVICE_STOP_LIST")"
     cmd="${cmd} CERT_CHOICE=$(shell_quote "$CERT_CHOICE")"
+    cmd="${cmd} ALWAYS_START_TROJAN=$(shell_quote "$ALWAYS_START_TROJAN")"
     cmd="${cmd} DISPLAY_TZ=$(shell_quote "$DISPLAY_TZ")"
     [ -n "$CONFIG_PATH" ] && cmd="${cmd} CONFIG_PATH=$(shell_quote "$CONFIG_PATH")"
     [ -n "$DOMAIN" ] && cmd="${cmd} DOMAIN=$(shell_quote "$DOMAIN")"
     [ -n "$TROJAN_CLI" ] && cmd="${cmd} TROJAN_CLI=$(shell_quote "$TROJAN_CLI")"
+    [ -n "$TROJAN_SERVICE" ] && cmd="${cmd} TROJAN_SERVICE=$(shell_quote "$TROJAN_SERVICE")"
     cmd="${cmd} ${INSTALL_PATH} >/dev/null 2>&1"
 
     cat > "$CRON_FILE" <<EOF

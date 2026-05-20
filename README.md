@@ -6,6 +6,7 @@
 - 证书快过期时才续签，默认提前 7 天
 - 续签前自动停止占用端口的服务
 - 续签后自动恢复原本正在运行的服务
+- 退出前强制检查并拉起 Trojan 核心服务，避免续签后掉线
 - 没有 `nginx` / `cloudreve` 也能用，只运行 `trojan` 的服务器也能跑
 - 失败时恢复 Trojan 原配置，避免写入坏证书路径
 
@@ -79,6 +80,12 @@ bash install.sh
 /usr/local/sbin/trojan-auto-cert-renew --force
 ```
 
+如果续签后 Trojan 没起来，可以直接恢复：
+
+```bash
+/usr/local/sbin/trojan-auto-cert-renew --recover
+```
+
 ## 自定义参数
 
 提前 15 天续签：
@@ -99,7 +106,13 @@ DOMAIN=www.example.com CONFIG_PATH=/usr/local/etc/trojan/config.json bash instal
 SERVICE_STOP_LIST="trojan" bash install.sh
 ```
 
-安装时传入的 `DOMAIN`、`CONFIG_PATH`、`TROJAN_CLI`、`SERVICE_STOP_LIST`、`RENEW_DAYS` 会写入定时任务。后面要修改，可以编辑：
+如果你的服务名不是 `trojan` 或 `trojan-go`，安装时指定：
+
+```bash
+TROJAN_SERVICE=你的服务名 bash install.sh
+```
+
+安装时传入的 `DOMAIN`、`CONFIG_PATH`、`TROJAN_CLI`、`TROJAN_SERVICE`、`SERVICE_STOP_LIST`、`RENEW_DAYS` 会写入定时任务。后面要修改，可以编辑：
 
 ```text
 /etc/cron.d/trojan-auto-cert-renew
@@ -151,6 +164,8 @@ cloudreve
 ```
 
 没有安装的服务会自动忽略。
+
+脚本还会自动扫描 `trojan*.service`，并排除 `trojan-web`、`trojan-go-ip-limit` 这类辅助服务。续签结束前会检查 Trojan 核心服务是否运行；如果没运行，会再执行一次 `systemctl start`。
 
 当前无人值守模式只自动选择 Trojan 菜单里的：
 
