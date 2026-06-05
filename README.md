@@ -187,6 +187,20 @@ DISABLE_ACME_CRON=0 bash install.sh
 bash uninstall.sh
 ```
 
+或者直接运行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/uninstall.sh | bash
+```
+
+默认只删除自动续签脚本和定时任务，不删除证书、`acme.sh`、Trojan 配置、Trojan 服务。
+
+连日志和脚本备份一起清理：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/uninstall.sh | PURGE=1 bash
+```
+
 ## Debian 10 源过期
 
 如果安装时出现类似：
