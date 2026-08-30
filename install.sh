@@ -7,12 +7,15 @@ PREFIX="${PREFIX:-/usr/local}"
 INSTALL_PATH="${INSTALL_PATH:-${PREFIX}/sbin/trojan-auto-cert-renew}"
 CRON_FILE="${CRON_FILE:-/etc/cron.d/trojan-auto-cert-renew}"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main}"
-RENEW_DAYS="${RENEW_DAYS:-7}"
+RENEW_DAYS="${RENEW_DAYS:-15}"
 CHECK_MINUTE="${CHECK_MINUTE:-17}"
 CHECK_HOUR="${CHECK_HOUR:-4}"
+DAILY_RESTART="${DAILY_RESTART:-1}"
+RESTART_MINUTE="${RESTART_MINUTE:-47}"
+RESTART_HOUR="${RESTART_HOUR:-4}"
 RUN_CHECK="${RUN_CHECK:-1}"
 DISABLE_ACME_CRON="${DISABLE_ACME_CRON:-1}"
-SERVICE_STOP_LIST="${SERVICE_STOP_LIST:-trojan trojan-go nginx caddy apache2 httpd cloudreve}"
+SERVICE_STOP_LIST="${SERVICE_STOP_LIST:-trojan trojan-go trojan-web nginx caddy apache2 httpd cloudreve}"
 CONFIG_PATH="${CONFIG_PATH:-}"
 DOMAIN="${DOMAIN:-}"
 TROJAN_CLI="${TROJAN_CLI:-}"
@@ -29,12 +32,15 @@ Usage:
   curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/install.sh | bash
 
 Environment variables:
-  RENEW_DAYS=7
+  RENEW_DAYS=15
   CHECK_HOUR=4
   CHECK_MINUTE=17
+  DAILY_RESTART=1
+  RESTART_HOUR=4
+  RESTART_MINUTE=47
   RUN_CHECK=1
   DISABLE_ACME_CRON=1
-  SERVICE_STOP_LIST="trojan trojan-go nginx caddy apache2 httpd cloudreve"
+  SERVICE_STOP_LIST="trojan trojan-go trojan-web nginx caddy apache2 httpd cloudreve"
   CONFIG_PATH=/usr/local/etc/trojan/config.json
   DOMAIN=www.example.com
   TROJAN_CLI=/usr/local/bin/trojan
@@ -178,8 +184,9 @@ shell_quote() {
 }
 
 install_cron() {
-    local cmd
+    local cmd restart_cmd restart_line
     cmd="RENEW_DAYS=$(shell_quote "$RENEW_DAYS")"
+    cmd="${cmd} TROJAN_AUTO_CERT_CRON=1"
     cmd="${cmd} DISABLE_ACME_CRON=$(shell_quote "$DISABLE_ACME_CRON")"
     cmd="${cmd} SERVICE_STOP_LIST=$(shell_quote "$SERVICE_STOP_LIST")"
     cmd="${cmd} CERT_CHOICE=$(shell_quote "$CERT_CHOICE")"
@@ -189,12 +196,22 @@ install_cron() {
     [ -n "$DOMAIN" ] && cmd="${cmd} DOMAIN=$(shell_quote "$DOMAIN")"
     [ -n "$TROJAN_CLI" ] && cmd="${cmd} TROJAN_CLI=$(shell_quote "$TROJAN_CLI")"
     [ -n "$TROJAN_SERVICE" ] && cmd="${cmd} TROJAN_SERVICE=$(shell_quote "$TROJAN_SERVICE")"
-    cmd="${cmd} ${INSTALL_PATH} >/dev/null 2>&1"
+    cmd="${cmd} ${INSTALL_PATH} --scheduled >/dev/null 2>&1"
+
+    restart_line=""
+    if [ "$DAILY_RESTART" = "1" ]; then
+        restart_cmd="TROJAN_AUTO_CERT_CRON=1"
+        restart_cmd="${restart_cmd} DISPLAY_TZ=$(shell_quote "$DISPLAY_TZ")"
+        [ -n "$TROJAN_SERVICE" ] && restart_cmd="${restart_cmd} TROJAN_SERVICE=$(shell_quote "$TROJAN_SERVICE")"
+        restart_cmd="${restart_cmd} ${INSTALL_PATH} --restart >/dev/null 2>&1"
+        restart_line="${RESTART_MINUTE} ${RESTART_HOUR} * * * root ${restart_cmd}"
+    fi
 
     cat > "$CRON_FILE" <<EOF
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ${CHECK_MINUTE} ${CHECK_HOUR} * * * root ${cmd}
+${restart_line}
 EOF
     chmod 644 "$CRON_FILE"
     log "Installed cron: $CRON_FILE"
@@ -206,6 +223,9 @@ print_install_result() {
     if [ -f "$CRON_FILE" ] && grep -q "$INSTALL_PATH" "$CRON_FILE"; then
         log "[OK] 定时任务已安装: $CRON_FILE"
         log "自动检查时间: 每天 ${CHECK_HOUR}:${CHECK_MINUTE}"
+        if [ "$DAILY_RESTART" = "1" ]; then
+            log "Trojan 自动重启时间: 每天 ${RESTART_HOUR}:${RESTART_MINUTE}（每 24 小时一次）"
+        fi
     else
         die "cron install failed: $CRON_FILE"
     fi
@@ -231,12 +251,14 @@ main() {
             log "[OK] 证书检测成功"
         else
             log "[WARN] 安装已完成，但当前没有检测到有效证书"
-            log "需要立即申请/测试时运行: ${INSTALL_PATH} --force"
+            log "需要立即申请时直接运行: ${INSTALL_PATH}"
         fi
     fi
 
     log "完成。手动状态检查: ${INSTALL_PATH} --status"
-    log "手动强制续签: ${INSTALL_PATH} --force"
+    log "手动立即申请并安装: ${INSTALL_PATH}"
+    log "定时到期检查模式: ${INSTALL_PATH} --scheduled"
+    log "手动重启 Trojan: ${INSTALL_PATH} --restart"
 }
 
 main "$@"

@@ -7,42 +7,79 @@ CONFIG_PATH="${CONFIG_PATH:-}"
 DOMAIN="${DOMAIN:-}"
 TROJAN_CLI="${TROJAN_CLI:-}"
 TROJAN_SERVICE="${TROJAN_SERVICE:-}"
-RENEW_DAYS="${RENEW_DAYS:-7}"
+RENEW_DAYS="${RENEW_DAYS:-15}"
 LOG_FILE="${LOG_FILE:-/var/log/trojan-auto-cert-renew.log}"
 BACKUP_DIR="${BACKUP_DIR:-/root/trojan-cert-backups}"
 CERT_CHOICE="${CERT_CHOICE:-1}"
 DISABLE_ACME_CRON="${DISABLE_ACME_CRON:-1}"
-SERVICE_STOP_LIST="${SERVICE_STOP_LIST:-trojan trojan-go nginx caddy apache2 httpd cloudreve}"
+SERVICE_STOP_LIST="${SERVICE_STOP_LIST:-trojan trojan-go trojan-web nginx caddy apache2 httpd cloudreve}"
 ALWAYS_START_TROJAN="${ALWAYS_START_TROJAN:-1}"
 DISPLAY_TZ="${DISPLAY_TZ:-Asia/Shanghai}"
+DOMAIN_SOURCE=""
 
 FORCE=0
+SCHEDULED=0
 DRY_RUN=0
 STATUS=0
 RECOVER=0
+RESTART=0
 STARTED_SERVICES=()
+STARTED_SERVICES_COUNT=0
 TROJAN_WEB_WAS_ACTIVE=0
+
+invoked_by_cron() {
+    [ "${TROJAN_AUTO_CERT_CRON:-0}" = "1" ] && return 0
+
+    local pid comm next_pid hops
+    pid="$PPID"
+    hops=0
+    while [ "$pid" -gt 1 ] 2>/dev/null && [ "$hops" -lt 5 ]; do
+        comm="$(ps -p "$pid" -o comm= 2>/dev/null | tr -d '[:space:]')"
+        case "$comm" in
+            cron|crond|CRON)
+                return 0
+                ;;
+        esac
+        next_pid="$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d '[:space:]')"
+        case "$next_pid" in
+            ''|*[!0-9]*) break ;;
+        esac
+        pid="$next_pid"
+        hops=$((hops + 1))
+    done
+    return 1
+}
 
 usage() {
     cat <<'USAGE'
 Usage:
-  trojan-auto-cert-renew [--force] [--dry-run] [--status] [--recover]
+  trojan-auto-cert-renew
+  trojan-auto-cert-renew --scheduled
+  trojan-auto-cert-renew [--force] [--dry-run] [--status] [--recover] [--restart]
+
+Modes:
+  no argument     Auto-detect the domain and immediately request/install a certificate
+  --scheduled     Check expiry first; renew only within RENEW_DAYS (used by cron)
+  --force         Immediately request/install a certificate
+  --status        Show the detected domain, certificate and expiry
+  --dry-run       Test auto-detection without requesting a certificate
+  --recover       Start detected Trojan core services
+  --restart       Restart detected Trojan core services
 
 Environment variables:
   CONFIG_PATH=/usr/local/etc/trojan/config.json
   DOMAIN=www.example.com
   TROJAN_CLI=/usr/local/bin/trojan
   TROJAN_SERVICE=trojan
-  RENEW_DAYS=7
+  RENEW_DAYS=15
   DISPLAY_TZ=Asia/Shanghai
   SERVICE_STOP_LIST="trojan nginx cloudreve"
   ALWAYS_START_TROJAN=1
   CERT_CHOICE=1
 
-Default behavior:
-  Detect the Trojan domain, skip if the certificate is valid beyond RENEW_DAYS,
-  otherwise stop active services that may occupy 80/443, run Trojan's own
-  certificate tool, validate the new cert/key, and restore services.
+Default manual behavior:
+  Detect the Trojan domain and immediately request/install a Let's Encrypt
+  certificate. The installed cron job uses --scheduled to avoid repeated issuance.
 USAGE
 }
 
@@ -50,6 +87,9 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --force|force)
             FORCE=1
+            ;;
+        --scheduled|scheduled|--auto|auto)
+            SCHEDULED=1
             ;;
         --dry-run|dry-run)
             DRY_RUN=1
@@ -59,6 +99,9 @@ while [ "$#" -gt 0 ]; do
             ;;
         --recover|recover)
             RECOVER=1
+            ;;
+        --restart|restart)
+            RESTART=1
             ;;
         --help|-h)
             usage
@@ -72,6 +115,18 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
+
+if [ "$SCHEDULED" != "1" ] \
+    && [ "$STATUS" != "1" ] \
+    && [ "$DRY_RUN" != "1" ] \
+    && [ "$RECOVER" != "1" ] \
+    && [ "$RESTART" != "1" ]; then
+    if invoked_by_cron; then
+        SCHEDULED=1
+    else
+        FORCE=1
+    fi
+fi
 
 log() {
     printf '%s %s\n' "$(date '+%F %T')" "$*"
@@ -137,7 +192,9 @@ service_exists() {
     local svc="$1"
     local state
     svc="${svc%.service}"
-    state="$(systemctl show -p LoadState --value "${svc}.service" 2>/dev/null || true)"
+    state="$(systemctl show -p LoadState "${svc}.service" 2>/dev/null \
+        | sed -n 's/^LoadState=//p' \
+        | head -n 1)"
     [ -n "$state" ] && [ "$state" != "not-found" ]
 }
 
@@ -245,20 +302,90 @@ domain_from_trojan_info() {
         | head -n 1
 }
 
-detect_domain() {
-    [ -n "$DOMAIN" ] && return 0
+normalize_domain() {
+    local value="$1"
+    value="${value#http://}"
+    value="${value#https://}"
+    value="${value%%/*}"
+    value="${value%%:*}"
+    value="${value%.}"
+    printf '%s' "$value" | tr '[:upper:]' '[:lower:]'
+}
 
+valid_domain() {
+    local value="$1"
+    [ -n "$value" ] || return 1
+    [ "${value#\*.}" = "$value" ] || return 1
+    printf '%s\n' "$value" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' && return 1
+    printf '%s\n' "$value" | grep -Eiq '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+}
+
+accept_domain() {
+    local source="$1"
     local value
+    value="$(normalize_domain "$2")"
+    valid_domain "$value" || return 1
+    DOMAIN="$value"
+    DOMAIN_SOURCE="$source"
+    return 0
+}
+
+domain_from_current_cert() {
+    local cert value
+    cert="$(current_cert_path)"
+    [ -n "$cert" ] && [ -s "$cert" ] || return 0
+
+    value="$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null \
+        | tr ',' '\n' \
+        | sed -n 's/.*DNS:[[:space:]]*\([^[:space:]]*\).*/\1/p' \
+        | head -n 1 || true)"
+    if [ -n "$value" ]; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+
+    openssl x509 -in "$cert" -noout -subject 2>/dev/null \
+        | sed -n -E 's/.*CN[[:space:]]*=[[:space:]]*([^,\/[:space:]]+).*/\1/p' \
+        | head -n 1 || true
+}
+
+domain_from_cert_path() {
+    local cert directory
+    cert="$(current_cert_path)"
+    [ -n "$cert" ] || return 0
+    directory="$(basename "$(dirname "$cert")")"
+    directory="${directory%_ecc}"
+    printf '%s\n' "$directory"
+}
+
+detect_domain() {
+    local value
+
+    if [ -n "$DOMAIN" ]; then
+        value="$DOMAIN"
+        DOMAIN=""
+        accept_domain "environment variable DOMAIN" "$value" \
+            || die "invalid DOMAIN value: $value"
+        return 0
+    fi
+
     for path in ssl.sni sni server_name domain host; do
         value="$(json_get "$path" | tr -d '[:space:]')"
-        if [ -n "$value" ] && ! printf '%s' "$value" | grep -Eq '^(0\.0\.0\.0|127\.0\.0\.1|localhost)$'; then
-            DOMAIN="$value"
+        if accept_domain "Trojan config field $path" "$value"; then
             return 0
         fi
     done
 
-    DOMAIN="$(domain_from_trojan_info | tr -d '[:space:]')"
-    [ -n "$DOMAIN" ] || die "could not detect domain from config or 'trojan info'; set DOMAIN=www.example.com"
+    value="$(domain_from_trojan_info | tr -d '[:space:]')"
+    accept_domain "trojan info share link" "$value" && return 0
+
+    value="$(domain_from_current_cert | tr -d '[:space:]')"
+    accept_domain "current certificate" "$value" && return 0
+
+    value="$(domain_from_cert_path | tr -d '[:space:]')"
+    accept_domain "current certificate path" "$value" && return 0
+
+    die "could not auto-detect a valid domain from Trojan config, 'trojan info', or the current certificate; set DOMAIN=www.example.com"
 }
 
 current_cert_path() {
@@ -323,6 +450,7 @@ print_status_report() {
 
     log "[OK] 自动续签脚本可读取 Trojan 配置"
     log "域名: $DOMAIN"
+    log "域名来源: $DOMAIN_SOURCE"
     log "配置文件: $CONFIG_PATH"
     log "Trojan 命令: $TROJAN_CLI"
     log "证书文件: ${cert:-未配置}"
@@ -349,6 +477,35 @@ print_status_report() {
     return 1
 }
 
+print_success_report() {
+    local cert="$1"
+    local key="$2"
+    local end_date svc found
+    end_date="$(cert_end_date "$cert")"
+    found=0
+
+    log "============================================================"
+    log "[OK] 证书申请并安装成功"
+    log "域名: $DOMAIN"
+    log "域名来源: $DOMAIN_SOURCE"
+    log "证书文件: $cert"
+    log "私钥文件: $key"
+    log "到期时间: $(format_cert_date "$end_date")"
+
+    while IFS= read -r svc; do
+        [ -n "$svc" ] || continue
+        found=1
+        if service_active "$svc"; then
+            log "Trojan 服务: $svc (运行中)"
+        else
+            log "[WARN] Trojan 服务: $svc (未运行)"
+        fi
+    done < <(trojan_service_candidates)
+
+    [ "$found" = "1" ] || log "[WARN] 未识别到 Trojan systemd 服务"
+    log "============================================================"
+}
+
 disable_acme_cron() {
     [ "$DISABLE_ACME_CRON" = "1" ] || return 0
     command -v crontab >/dev/null 2>&1 || return 0
@@ -363,9 +520,9 @@ disable_acme_cron() {
 restore_services() {
     local i svc
 
-    if [ "${#STARTED_SERVICES[@]}" -gt 0 ]; then
+    if [ "$STARTED_SERVICES_COUNT" -gt 0 ]; then
         log "Restoring services..."
-        for ((i=${#STARTED_SERVICES[@]}-1; i>=0; i--)); do
+        for ((i=STARTED_SERVICES_COUNT-1; i>=0; i--)); do
             svc="${STARTED_SERVICES[$i]}"
             log "Starting $svc"
             systemctl start "$svc" || true
@@ -417,6 +574,36 @@ recover_trojan_services() {
     return "$failed"
 }
 
+restart_trojan_services() {
+    local svc found failed
+    found=0
+    failed=0
+
+    while IFS= read -r svc; do
+        [ -n "$svc" ] || continue
+        found=1
+        log "Restarting Trojan service: $svc"
+        systemctl restart "$svc" || {
+            systemctl stop "$svc" || true
+            systemctl start "$svc" || true
+        }
+
+        if service_active "$svc"; then
+            log "[OK] Trojan 服务已重启并运行: $svc"
+        else
+            log "[WARN] Trojan 服务重启后未运行: $svc"
+            failed=1
+        fi
+    done < <(trojan_service_candidates)
+
+    if [ "$found" = "0" ]; then
+        log "[WARN] 未识别到 Trojan systemd 服务；如服务名特殊，请设置 TROJAN_SERVICE=服务名"
+        return 1
+    fi
+
+    return "$failed"
+}
+
 fail_with_restore() {
     local backup="$1"
     shift
@@ -438,17 +625,22 @@ stop_active_services() {
     for svc in $SERVICE_STOP_LIST $(trojan_service_candidates); do
         svc="${svc%.service}"
         if service_exists "$svc" && service_active "$svc"; then
-            for existing in "${STARTED_SERVICES[@]}"; do
-                [ "$existing" = "$svc" ] && continue 2
-            done
-            STARTED_SERVICES+=("$svc")
+            if [ "$STARTED_SERVICES_COUNT" -gt 0 ]; then
+                for existing in "${STARTED_SERVICES[@]}"; do
+                    [ "$existing" = "$svc" ] && continue 2
+                done
+            fi
+            STARTED_SERVICES[$STARTED_SERVICES_COUNT]="$svc"
+            STARTED_SERVICES_COUNT=$((STARTED_SERVICES_COUNT + 1))
         fi
     done
 
-    for svc in "${STARTED_SERVICES[@]}"; do
-        log "Stopping $svc"
-        systemctl stop "$svc"
-    done
+    if [ "$STARTED_SERVICES_COUNT" -gt 0 ]; then
+        for svc in "${STARTED_SERVICES[@]}"; do
+            log "Stopping $svc"
+            systemctl stop "$svc"
+        done
+    fi
 }
 
 port80_listeners() {
@@ -506,6 +698,11 @@ main() {
         exit $?
     fi
 
+    if [ "$RESTART" = "1" ]; then
+        restart_trojan_services
+        exit $?
+    fi
+
     need_cmd openssl
     detect_trojan_cli
     detect_config_path
@@ -518,6 +715,7 @@ main() {
     key="$(current_key_path)"
 
     log "Detected domain: $DOMAIN"
+    log "Detected domain source: $DOMAIN_SOURCE"
     log "Detected config: $CONFIG_PATH"
     log "Detected Trojan CLI: $TROJAN_CLI"
     log "Configured cert: ${cert:-unknown}"
@@ -533,17 +731,19 @@ main() {
         exit 0
     fi
 
-    if [ "$FORCE" != "1" ] && cert_is_fresh "$cert"; then
+    if [ "$SCHEDULED" = "1" ] && [ "$FORCE" != "1" ] && cert_is_fresh "$cert"; then
         end_date="$(cert_end_date "$cert")"
-        log "Certificate is valid beyond ${RENEW_DAYS} days, expires: $(format_cert_date "$end_date"). Skip."
+        log "[OK] 定时检查完成：证书剩余有效期超过 ${RENEW_DAYS} 天，无需申请"
+        log "域名: $DOMAIN"
+        log "到期时间: $(format_cert_date "$end_date")"
         disable_acme_cron
         exit 0
     fi
 
-    if [ "$FORCE" = "1" ]; then
-        log "Force mode enabled; renewal will run now."
+    if [ "$SCHEDULED" = "1" ] && [ "$FORCE" != "1" ]; then
+        log "定时检查发现证书缺失或将在 ${RENEW_DAYS} 天内过期，立即申请并安装"
     else
-        log "Certificate is missing or expires within ${RENEW_DAYS} days; renewal will run now."
+        log "手动运行模式：已自动识别域名，将立即申请并安装新证书"
     fi
 
     mkdir -p "$BACKUP_DIR"
@@ -565,9 +765,10 @@ main() {
     log "Trojan now points to cert: ${cert:-unknown}"
     validate_cert_files "$cert" "$key" || fail_with_restore "$backup" "new certificate/key validation failed"
 
-    end_date="$(cert_end_date "$cert")"
-    log "Certificate renewal finished successfully, new expiry: $(format_cert_date "$end_date")"
     disable_acme_cron
+    restore_services
+    trap - EXIT
+    print_success_report "$cert" "$key"
 }
 
 main "$@"

@@ -2,10 +2,13 @@
 
 这个仓库把 Trojan 自带的 `trojan tls` 证书申请工具包了一层自动化：
 
-- 自动识别 Trojan 配置里的域名
-- 证书快过期时才续签，默认提前 7 天
+- 每台服务器自动识别自己的 Trojan 域名，不需要把域名写死在脚本里
+- 定时任务只在证书不足 15 天时续签，避免重复申请触发 CA 限额
+- 人工直接运行脚本时立即申请并安装，不等待到期
 - 续签前自动停止占用端口的服务
 - 续签后自动恢复原本正在运行的服务
+- 申请完成后明确显示成功提示、域名、证书路径和北京时间到期时间
+- 每 24 小时自动重启一次各服务器实际使用的 Trojan 核心服务
 - 退出前强制检查并拉起 Trojan 核心服务，避免续签后掉线
 - 没有 `nginx` / `cloudreve` 也能用，只运行 `trojan` 的服务器也能跑
 - 失败时恢复 Trojan 原配置，避免写入坏证书路径
@@ -42,7 +45,9 @@ bash install.sh
 /root/trojan-cert-backups/
 ```
 
-默认每天 `04:17` 检查一次。
+默认每天 `04:17` 运行一次 `--scheduled` 到期检查，并在每天 `04:47` 运行一次 `--restart` 重启 Trojan（即每 24 小时一次）。两个任务错开执行，证书申请和日常重启不会同时发生。
+
+新版定时任务会显式使用 `--scheduled`。脚本也能识别由 `cron` 启动的旧版无参数任务，自动按到期检查处理，防止升级后每天强制申请证书。
 
 安装完成后会直接打印：
 
@@ -57,10 +62,34 @@ bash install.sh
 
 ```text
 [WARN] 安装已完成，但当前没有检测到有效证书
-需要立即申请/测试时运行: /usr/local/sbin/trojan-auto-cert-renew --force
+需要立即申请时直接运行: /usr/local/sbin/trojan-auto-cert-renew
 ```
 
-## 手动测试
+## 手动运行
+
+自动识别当前服务器域名并立即申请、安装新证书：
+
+```bash
+/usr/local/sbin/trojan-auto-cert-renew
+```
+
+成功后会直接显示：
+
+```text
+[OK] 证书申请并安装成功
+域名: www.example.com
+域名来源: current certificate
+证书文件: /root/.acme.sh/www.example.com_ecc/fullchain.cer
+私钥文件: /root/.acme.sh/www.example.com_ecc/www.example.com.key
+到期时间: 2026 年 11 月 27 日 21:28:13
+Trojan 服务: trojan (运行中)
+```
+
+同样的结果会写入：
+
+```text
+/var/log/trojan-auto-cert-renew.log
+```
 
 查看安装和证书状态：
 
@@ -74,10 +103,16 @@ bash install.sh
 /usr/local/sbin/trojan-auto-cert-renew --dry-run
 ```
 
-强制走一次续签流程：
+`--force` 是“立即申请”的兼容别名，与不带参数直接运行效果相同：
 
 ```bash
 /usr/local/sbin/trojan-auto-cert-renew --force
+```
+
+只在不足 15 天时申请（定时任务使用这个模式）：
+
+```bash
+/usr/local/sbin/trojan-auto-cert-renew --scheduled
 ```
 
 如果续签后 Trojan 没起来，可以直接恢复：
@@ -86,12 +121,30 @@ bash install.sh
 /usr/local/sbin/trojan-auto-cert-renew --recover
 ```
 
+手动立即重启自动识别到的 Trojan 核心服务：
+
+```bash
+/usr/local/sbin/trojan-auto-cert-renew --restart
+```
+
 ## 自定义参数
 
-提前 15 天续签：
+修改定时任务的提前续签天数：
 
 ```bash
 RENEW_DAYS=15 bash install.sh
+```
+
+修改每天重启 Trojan 的时间：
+
+```bash
+RESTART_HOUR=4 RESTART_MINUTE=47 bash install.sh
+```
+
+如果不需要每日重启，可以关闭：
+
+```bash
+DAILY_RESTART=0 bash install.sh
 ```
 
 指定域名和配置文件：
@@ -112,7 +165,7 @@ SERVICE_STOP_LIST="trojan" bash install.sh
 TROJAN_SERVICE=你的服务名 bash install.sh
 ```
 
-安装时传入的 `DOMAIN`、`CONFIG_PATH`、`TROJAN_CLI`、`TROJAN_SERVICE`、`SERVICE_STOP_LIST`、`RENEW_DAYS` 会写入定时任务。后面要修改，可以编辑：
+正常情况下不要传 `DOMAIN`，让每台服务器自动识别自己的域名。安装时明确传入的 `DOMAIN`、`CONFIG_PATH`、`TROJAN_CLI`、`TROJAN_SERVICE`、`SERVICE_STOP_LIST`、`RENEW_DAYS` 以及重启时间会写入定时任务。后面要修改，可以编辑：
 
 ```text
 /etc/cron.d/trojan-auto-cert-renew
@@ -138,6 +191,10 @@ DISPLAY_TZ=Asia/Shanghai bash install.sh
 2. Trojan JSON 配置里的 `ssl.sni`
 3. 其他常见字段：`sni`、`server_name`、`domain`、`host`
 4. `trojan info` 分享链接里的域名
+5. 当前证书的 SAN / CN 域名
+6. 当前 `acme.sh` 证书目录名
+
+检测到的值会先规范化并验证为合法域名；IP、`localhost` 和通配符不会被当作 HTTP-01 申请域名。检测失败时脚本会停止，不会随意申请错误域名。
 
 脚本会按顺序查找配置：
 
@@ -156,6 +213,7 @@ DISPLAY_TZ=Asia/Shanghai bash install.sh
 ```text
 trojan
 trojan-go
+trojan-web
 nginx
 caddy
 apache2
@@ -165,7 +223,7 @@ cloudreve
 
 没有安装的服务会自动忽略。
 
-脚本还会自动扫描 `trojan*.service`，并排除 `trojan-web`、`trojan-go-ip-limit` 这类辅助服务。续签结束前会检查 Trojan 核心服务是否运行；如果没运行，会再执行一次 `systemctl start`。
+脚本还会自动扫描 Trojan 核心服务，并排除 `trojan-web`、`trojan-go-ip-limit` 这类辅助服务；`trojan-web` 会由默认停止列表单独管理，因为部分安装会由它占用 `80` 端口。续签结束后只恢复原先运行的服务，并再次确认 Trojan 核心服务已启动。
 
 当前无人值守模式只自动选择 Trojan 菜单里的：
 
