@@ -29,6 +29,19 @@ bash install.sh
 curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/install.sh | bash
 ```
 
+安装完成后会显示选择菜单，直接按回车默认使用自动模式：
+
+```text
+请选择本次证书处理方式：
+  1) 自动模式（推荐）：自动识别域名，仅在证书缺失或不足 15 天时申请
+  2) 手动立即申请：自动识别域名并马上申请、安装
+  3) 手动指定域名：输入域名并马上申请、安装
+  4) 只查看域名、证书和到期时间
+请选择 [1-4，默认 1]:
+```
+
+菜单只在人工安装时显示。没有交互终端的自动部署会默认选择自动模式；定时任务本身不会弹出菜单，也不会等待输入。
+
 私有仓库可以按你自己的 Token 拉取方式克隆后运行：
 
 ```bash
@@ -145,6 +158,19 @@ RESTART_HOUR=4 RESTART_MINUTE=47 bash install.sh
 
 ```bash
 DAILY_RESTART=0 bash install.sh
+```
+
+自动化安装时也可以跳过菜单，直接指定本次操作：
+
+```bash
+# 自动检查，到期才申请
+curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/install.sh | INSTALL_ACTION=automatic bash
+
+# 自动识别域名并立即申请
+curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/install.sh | INSTALL_ACTION=immediate bash
+
+# 指定域名并立即申请
+curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/install.sh | INSTALL_ACTION=domain MANUAL_DOMAIN=www.example.com bash
 ```
 
 指定域名和配置文件：

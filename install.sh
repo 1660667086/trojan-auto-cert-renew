@@ -14,6 +14,8 @@ DAILY_RESTART="${DAILY_RESTART:-1}"
 RESTART_MINUTE="${RESTART_MINUTE:-47}"
 RESTART_HOUR="${RESTART_HOUR:-4}"
 RUN_CHECK="${RUN_CHECK:-1}"
+INSTALL_ACTION="${INSTALL_ACTION:-ask}"
+MANUAL_DOMAIN="${MANUAL_DOMAIN:-}"
 DISABLE_ACME_CRON="${DISABLE_ACME_CRON:-1}"
 SERVICE_STOP_LIST="${SERVICE_STOP_LIST:-trojan trojan-go trojan-web nginx caddy apache2 httpd cloudreve}"
 CONFIG_PATH="${CONFIG_PATH:-}"
@@ -39,6 +41,8 @@ Environment variables:
   RESTART_HOUR=4
   RESTART_MINUTE=47
   RUN_CHECK=1
+  INSTALL_ACTION=ask
+  MANUAL_DOMAIN=www.example.com
   DISABLE_ACME_CRON=1
   SERVICE_STOP_LIST="trojan trojan-go trojan-web nginx caddy apache2 httpd cloudreve"
   CONFIG_PATH=/usr/local/etc/trojan/config.json
@@ -231,6 +235,79 @@ print_install_result() {
     fi
 }
 
+choose_install_action() {
+    local choice
+
+    case "$INSTALL_ACTION" in
+        automatic|immediate|domain|status)
+            return 0
+            ;;
+        ask)
+            ;;
+        *)
+            log "[WARN] 未识别的 INSTALL_ACTION=$INSTALL_ACTION，改用自动模式"
+            INSTALL_ACTION="automatic"
+            return 0
+            ;;
+    esac
+
+    if [ ! -t 1 ] || [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+        INSTALL_ACTION="automatic"
+        log "没有交互终端，默认使用自动模式"
+        return 0
+    fi
+
+    printf '\n请选择本次证书处理方式：\n' > /dev/tty
+    printf '  1) 自动模式（推荐）：自动识别域名，仅在证书缺失或不足 %s 天时申请\n' "$RENEW_DAYS" > /dev/tty
+    printf '  2) 手动立即申请：自动识别域名并马上申请、安装\n' > /dev/tty
+    printf '  3) 手动指定域名：输入域名并马上申请、安装\n' > /dev/tty
+    printf '  4) 只查看域名、证书和到期时间\n' > /dev/tty
+    printf '请选择 [1-4，默认 1]: ' > /dev/tty
+    IFS= read -r choice < /dev/tty || choice="1"
+
+    case "${choice:-1}" in
+        1) INSTALL_ACTION="automatic" ;;
+        2) INSTALL_ACTION="immediate" ;;
+        3) INSTALL_ACTION="domain" ;;
+        4) INSTALL_ACTION="status" ;;
+        *)
+            log "[WARN] 选择无效，默认使用自动模式"
+            INSTALL_ACTION="automatic"
+            ;;
+    esac
+
+    if [ "$INSTALL_ACTION" = "domain" ] && [ -z "$MANUAL_DOMAIN" ]; then
+        printf '请输入要申请证书的域名: ' > /dev/tty
+        IFS= read -r MANUAL_DOMAIN < /dev/tty || MANUAL_DOMAIN=""
+    fi
+}
+
+run_install_action() {
+    case "$INSTALL_ACTION" in
+        automatic)
+            log "[OK] 已选择自动模式：开始识别域名并检查证书到期时间"
+            "$INSTALL_PATH" --scheduled
+            ;;
+        immediate)
+            log "已选择手动立即申请：开始自动识别域名"
+            "$INSTALL_PATH" --force
+            ;;
+        domain)
+            if [ -z "$MANUAL_DOMAIN" ]; then
+                log "[WARN] 未输入域名，改为自动识别并立即申请"
+                "$INSTALL_PATH" --force
+            else
+                log "已选择手动指定域名: $MANUAL_DOMAIN"
+                DOMAIN="$MANUAL_DOMAIN" "$INSTALL_PATH" --force
+            fi
+            ;;
+        status)
+            log "已选择只查看状态"
+            "$INSTALL_PATH" --status
+            ;;
+    esac
+}
+
 main() {
     case "${1:-}" in
         --help|-h)
@@ -246,12 +323,10 @@ main() {
     print_install_result
 
     if [ "$RUN_CHECK" = "1" ]; then
-        log "正在检查证书状态..."
-        if "$INSTALL_PATH" --status; then
-            log "[OK] 证书检测成功"
-        else
-            log "[WARN] 安装已完成，但当前没有检测到有效证书"
-            log "需要立即申请时直接运行: ${INSTALL_PATH}"
+        choose_install_action
+        if ! run_install_action; then
+            log "[WARN] 安装和定时任务已完成，但本次证书操作没有成功"
+            log "可检查日志后重试: ${INSTALL_PATH}"
         fi
     fi
 

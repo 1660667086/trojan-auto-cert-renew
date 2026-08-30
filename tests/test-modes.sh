@@ -108,9 +108,13 @@ grep -Fq '到期时间: 2026 年 11 月 27 日 21:28:13' <<<"$manual_output"
 INSTALLED_SCRIPT="${TMP_DIR}/installed/trojan-auto-cert-renew"
 CRON_FILE="${TMP_DIR}/trojan-auto-cert-renew.cron"
 mkdir -p "$(dirname "$INSTALLED_SCRIPT")"
-INSTALL_PATH="$INSTALLED_SCRIPT" CRON_FILE="$CRON_FILE" RUN_CHECK=0 \
+rm -f "$EXPECT_MARKER"
+install_output="$(INSTALL_PATH="$INSTALLED_SCRIPT" CRON_FILE="$CRON_FILE" \
+    RUN_CHECK=1 INSTALL_ACTION=automatic \
     CHECK_HOUR=4 CHECK_MINUTE=17 RESTART_HOUR=4 RESTART_MINUTE=47 \
-    "$ROOT_DIR/install.sh" >/dev/null
+    "$ROOT_DIR/install.sh")"
+grep -Fq '[OK] 已选择自动模式' <<<"$install_output"
+[ ! -e "$EXPECT_MARKER" ]
 grep -Fq '17 4 * * * root ' "$CRON_FILE"
 grep -Fq -- "$INSTALLED_SCRIPT --scheduled" "$CRON_FILE"
 grep -Fq '47 4 * * * root ' "$CRON_FILE"
