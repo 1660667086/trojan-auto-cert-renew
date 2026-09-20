@@ -105,6 +105,10 @@ grep -Fq '[OK] 证书申请并安装成功' <<<"$manual_output"
 grep -Fq '到期时间: 2026 年 11 月 27 日 21:28:13' <<<"$manual_output"
 [ -e "$EXPECT_MARKER" ]
 
+manual_domain_output="$(DOMAIN=manual.example.com "$SCRIPT" --force)"
+grep -Fq '[OK] 已将域名写入 Trojan 配置 ssl.sni: manual.example.com' <<<"$manual_domain_output"
+python3 -c 'import json, sys; assert json.load(open(sys.argv[1]))["ssl"]["sni"] == "manual.example.com"' "$CONFIG"
+
 INSTALLED_SCRIPT="${TMP_DIR}/installed/trojan-auto-cert-renew"
 CRON_FILE="${TMP_DIR}/trojan-auto-cert-renew.cron"
 mkdir -p "$(dirname "$INSTALLED_SCRIPT")"
