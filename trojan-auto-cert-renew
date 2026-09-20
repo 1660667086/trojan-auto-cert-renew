@@ -36,6 +36,8 @@ CLOUDREVE_ADMIN_ID="${CLOUDREVE_ADMIN_ID:-}"
 CLOUDREVE_ADMIN_EMAIL="${CLOUDREVE_ADMIN_EMAIL:-}"
 CLOUDREVE_ADMIN_NICK="${CLOUDREVE_ADMIN_NICK:-}"
 CLOUDREVE_ADMIN_PASSWORD="${CLOUDREVE_ADMIN_PASSWORD:-}"
+CLOUDREVE_ADMIN_STORAGE_GB="${CLOUDREVE_ADMIN_STORAGE_GB:-max}"
+CLOUDREVE_STORAGE_PATH="${CLOUDREVE_STORAGE_PATH:-}"
 CLOUDREVE_BACKUP_DIR="${CLOUDREVE_BACKUP_DIR:-/root/cloudreve-admin-backups}"
 DOMAIN_SOURCE=""
 
@@ -118,6 +120,8 @@ Environment variables:
   CLOUDREVE_ADMIN_EMAIL=admin@example.com
   CLOUDREVE_ADMIN_NICK=admin
   CLOUDREVE_ADMIN_PASSWORD=change-me
+  CLOUDREVE_ADMIN_STORAGE_GB=max
+  CLOUDREVE_STORAGE_PATH=/path/to/cloudreve/storage
   DISPLAY_TZ=Asia/Shanghai
   SERVICE_STOP_LIST="trojan nginx cloudreve"
   ALWAYS_START_TROJAN=1
@@ -654,6 +658,42 @@ print(salt + ":" + digest)
 '
 }
 
+cloudreve_admin_quota_bytes() {
+    local config_dir storage_path blocks quota_bytes quota_gib
+
+    case "$CLOUDREVE_ADMIN_STORAGE_GB" in
+        keep)
+            return 0
+            ;;
+        max|auto|'')
+            config_dir="$(cd "$(dirname "$CLOUDREVE_CONFIG")" && pwd)"
+            storage_path="${CLOUDREVE_STORAGE_PATH:-$config_dir}"
+            [ -e "$storage_path" ] || die "Cloudreve storage path does not exist: $storage_path"
+            blocks="$(df -Pk "$storage_path" | awk 'NR == 2 { print $2; exit }')"
+            [[ "$blocks" =~ ^[0-9]+$ ]] && [ "$blocks" -gt 0 ] \
+                || die "could not detect Cloudreve filesystem capacity: $storage_path"
+            quota_bytes=$((blocks * 1024))
+            [ "$quota_bytes" -gt 0 ] || die "detected Cloudreve filesystem capacity is invalid"
+            printf '%s\n' "$quota_bytes"
+            ;;
+        *[!0-9]*|0)
+            die "CLOUDREVE_ADMIN_STORAGE_GB must be max, keep, or a positive integer"
+            ;;
+        *)
+            quota_gib=$((10#$CLOUDREVE_ADMIN_STORAGE_GB))
+            quota_bytes=$((quota_gib * 1024 * 1024 * 1024))
+            [ "$quota_bytes" -gt 0 ] \
+                && [ $((quota_bytes / 1024 / 1024 / 1024)) -eq "$quota_gib" ] \
+                || die "CLOUDREVE_ADMIN_STORAGE_GB is too large"
+            printf '%s\n' "$quota_bytes"
+            ;;
+    esac
+}
+
+cloudreve_format_quota() {
+    awk -v bytes="$1" 'BEGIN { printf "%.2f GiB", bytes / 1073741824 }'
+}
+
 cloudreve_mysql_query() {
     local sql="$1"
     local args=(--batch --skip-column-names --raw --default-character-set=utf8mb4)
@@ -669,6 +709,7 @@ cloudreve_mysql_query() {
 
 cloudreve_mysql_dump() {
     local destination="$1"
+    shift
     local dump_cmd
     local args=(--single-transaction --skip-lock-tables --default-character-set=utf8mb4)
 
@@ -686,7 +727,7 @@ cloudreve_mysql_dump() {
         args+=(--protocol=TCP --host="$CR_DB_HOST" --port="$CR_DB_PORT")
     fi
     args+=(--user="$CR_DB_USER")
-    MYSQL_PWD="$CR_DB_PASSWORD" "$dump_cmd" "${args[@]}" "$CR_DB_NAME" "$CR_USER_TABLE" > "$destination"
+    MYSQL_PWD="$CR_DB_PASSWORD" "$dump_cmd" "${args[@]}" "$CR_DB_NAME" "$@" > "$destination"
 }
 
 cloudreve_sqlite_admin_row() {
@@ -696,25 +737,31 @@ cloudreve_sqlite_admin_row() {
     else
         python_cmd="python"
     fi
-    "$python_cmd" - "$CR_DB_FILE" "$CR_USER_TABLE" "$CLOUDREVE_ADMIN_ID" <<'PY'
+    "$python_cmd" - "$CR_DB_FILE" "$CR_USER_TABLE" "$CR_GROUP_TABLE" "$CLOUDREVE_ADMIN_ID" <<'PY'
 from __future__ import print_function
 import binascii
 import sqlite3
 import sys
 
-path, table, admin_id = sys.argv[1:]
+path, table, group_table, admin_id = sys.argv[1:]
 db = sqlite3.connect(path)
-sql = 'SELECT id,email,nick,password FROM "{}" WHERE group_id=1 AND deleted_at IS NULL'.format(table)
+sql = (
+    'SELECT u.id,u.email,u.nick,u.password,u.group_id,u.storage '
+    'FROM "{}" u INNER JOIN "{}" g ON g.id=u.group_id '
+    'WHERE u.group_id=1 AND u.deleted_at IS NULL'
+).format(table, group_table)
 params = []
 if admin_id:
-    sql += " AND id=?"
+    sql += " AND u.id=?"
     params.append(int(admin_id))
-sql += " ORDER BY id LIMIT 1"
+sql += " ORDER BY u.id LIMIT 1"
 row = db.execute(sql, params).fetchone()
 if row:
     email = binascii.hexlify((row[1] or "").encode("utf-8")).decode("ascii")
     nick = binascii.hexlify((row[2] or "").encode("utf-8")).decode("ascii")
-    print("{}\t{}\t{}\t{}".format(row[0], email, nick, row[3] or ""))
+    print("{}\t{}\t{}\t{}\t{}\t{}".format(
+        row[0], email, nick, row[3] or "", row[4], row[5] or 0
+    ))
 PY
 }
 
@@ -723,18 +770,20 @@ cloudreve_sqlite_update_admin() {
     local email="$2"
     local nick="$3"
     local password_hash="$4"
+    local group_id="$5"
+    local quota_bytes="$6"
     local python_cmd
     if command -v python3 >/dev/null 2>&1; then
         python_cmd="python3"
     else
         python_cmd="python"
     fi
-    "$python_cmd" - "$CR_DB_FILE" "$CR_USER_TABLE" "$admin_id" "$email" "$nick" "$password_hash" <<'PY'
+    "$python_cmd" - "$CR_DB_FILE" "$CR_USER_TABLE" "$CR_GROUP_TABLE" "$admin_id" "$email" "$nick" "$password_hash" "$group_id" "$quota_bytes" <<'PY'
 from __future__ import print_function
 import sqlite3
 import sys
 
-path, table, admin_id, email, nick, password_hash = sys.argv[1:]
+path, table, group_table, admin_id, email, nick, password_hash, group_id, quota_bytes = sys.argv[1:]
 db = sqlite3.connect(path)
 try:
     cursor = db.execute(
@@ -744,6 +793,13 @@ try:
     )
     if cursor.rowcount != 1:
         raise RuntimeError("administrator record was not updated")
+    if quota_bytes:
+        cursor = db.execute(
+            'UPDATE "{}" SET max_storage=?, updated_at=CURRENT_TIMESTAMP WHERE id=?'.format(group_table),
+            (int(quota_bytes), int(group_id)),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("administrator group quota was not updated")
     db.commit()
 finally:
     db.close()
@@ -751,9 +807,10 @@ PY
 }
 
 run_cloudreve_admin() {
-    local config_dir admin_row admin_id email_hex nick_hex stored_password
+    local config_dir admin_row admin_id email_hex nick_hex stored_password admin_group_id admin_storage
     local current_email current_nick input password_confirm password_hash
     local email_value nick_value email_sql nick_sql hash_sql update_result backup_path timestamp
+    local quota_bytes quota_sql quota_label
 
     detect_cloudreve_config
     log "Detected Cloudreve config: $CLOUDREVE_CONFIG"
@@ -770,6 +827,12 @@ run_cloudreve_admin() {
 
     [[ "$CR_TABLE_PREFIX" =~ ^[A-Za-z0-9_]+$ ]] || die "invalid Cloudreve table prefix"
     CR_USER_TABLE="${CR_TABLE_PREFIX}users"
+    CR_GROUP_TABLE="${CR_TABLE_PREFIX}groups"
+    quota_bytes="$(cloudreve_admin_quota_bytes)"
+    if [ -n "$quota_bytes" ]; then
+        [[ "$quota_bytes" =~ ^[0-9]+$ ]] || die "invalid Cloudreve administrator quota"
+        quota_label="$(cloudreve_format_quota "$quota_bytes")"
+    fi
     case "$CR_DB_UNIX_SOCKET" in
         true|1|yes) CR_DB_UNIX_SOCKET=1 ;;
         *) CR_DB_UNIX_SOCKET=0 ;;
@@ -783,9 +846,9 @@ run_cloudreve_admin() {
             has_cmd mysql || die "mysql client is required for this Cloudreve database"
             cloudreve_mysql_query "SELECT 1" >/dev/null || die "could not connect to the Cloudreve database"
             if [ -n "$CLOUDREVE_ADMIN_ID" ]; then
-                admin_row="$(cloudreve_mysql_query "SELECT id,HEX(email),HEX(nick),password FROM \`${CR_USER_TABLE}\` WHERE group_id=1 AND deleted_at IS NULL AND id=${CLOUDREVE_ADMIN_ID} ORDER BY id LIMIT 1")"
+                admin_row="$(cloudreve_mysql_query "SELECT u.id,HEX(u.email),HEX(u.nick),u.password,u.group_id,u.storage FROM \`${CR_USER_TABLE}\` u INNER JOIN \`${CR_GROUP_TABLE}\` g ON g.id=u.group_id WHERE u.group_id=1 AND u.deleted_at IS NULL AND u.id=${CLOUDREVE_ADMIN_ID} ORDER BY u.id LIMIT 1")"
             else
-                admin_row="$(cloudreve_mysql_query "SELECT id,HEX(email),HEX(nick),password FROM \`${CR_USER_TABLE}\` WHERE group_id=1 AND deleted_at IS NULL ORDER BY id LIMIT 1")"
+                admin_row="$(cloudreve_mysql_query "SELECT u.id,HEX(u.email),HEX(u.nick),u.password,u.group_id,u.storage FROM \`${CR_USER_TABLE}\` u INNER JOIN \`${CR_GROUP_TABLE}\` g ON g.id=u.group_id WHERE u.group_id=1 AND u.deleted_at IS NULL ORDER BY u.id LIMIT 1")"
             fi
             ;;
         sqlite|sqlite3)
@@ -803,7 +866,8 @@ run_cloudreve_admin() {
     esac
 
     [ -n "$admin_row" ] || die "no active Cloudreve v3 administrator was found"
-    IFS=$'\t' read -r admin_id email_hex nick_hex stored_password <<< "$admin_row"
+    IFS=$'\t' read -r admin_id email_hex nick_hex stored_password admin_group_id admin_storage <<< "$admin_row"
+    [[ "$admin_group_id" =~ ^[0-9]+$ ]] || die "invalid Cloudreve administrator group"
     case "$stored_password" in
         *:*) ;;
         *) die "unsupported Cloudreve password format; this entry currently supports Cloudreve v3" ;;
@@ -811,6 +875,11 @@ run_cloudreve_admin() {
     current_email="$(cloudreve_hex_decode "$email_hex")"
     current_nick="$(cloudreve_hex_decode "$nick_hex")"
     log "Detected Cloudreve administrator: ID=$admin_id, email=$current_email, nick=$current_nick"
+    if [ -n "$quota_bytes" ]; then
+        log "管理员组容量将设置为: $quota_label"
+    else
+        log "管理员组容量保持原值"
+    fi
 
     if [ -z "$CLOUDREVE_ADMIN_EMAIL" ]; then
         if [ -r /dev/tty ] && [ -w /dev/tty ]; then
@@ -858,24 +927,29 @@ run_cloudreve_admin() {
     timestamp="$(date '+%Y%m%d%H%M%S')"
     case "$CR_DB_TYPE" in
         mysql|mariadb)
-            backup_path="${CLOUDREVE_BACKUP_DIR}/${CR_DB_NAME}-${CR_USER_TABLE}.${timestamp}.sql"
-            cloudreve_mysql_dump "$backup_path" || die "Cloudreve database backup failed"
+            backup_path="${CLOUDREVE_BACKUP_DIR}/${CR_DB_NAME}-admin.${timestamp}.sql"
+            cloudreve_mysql_dump "$backup_path" "$CR_USER_TABLE" "$CR_GROUP_TABLE" \
+                || die "Cloudreve database backup failed"
             chmod 600 "$backup_path"
             email_value="$(cloudreve_to_hex "$CLOUDREVE_ADMIN_EMAIL")"
             nick_value="$(cloudreve_to_hex "$CLOUDREVE_ADMIN_NICK")"
             email_sql="CONVERT(0x${email_value} USING utf8mb4)"
             nick_sql="CONVERT(0x${nick_value} USING utf8mb4)"
             hash_sql="0x$(cloudreve_to_hex "$password_hash")"
-            if ! update_result="$(cloudreve_mysql_query "UPDATE \`${CR_USER_TABLE}\` SET email=${email_sql},nick=${nick_sql},password=${hash_sql},updated_at=NOW() WHERE id=${admin_id} AND group_id=1; SELECT ROW_COUNT();")"; then
+            quota_sql="SET @quota_ok=1;"
+            if [ -n "$quota_bytes" ]; then
+                quota_sql="UPDATE \`${CR_GROUP_TABLE}\` SET max_storage=${quota_bytes},updated_at=NOW() WHERE id=${admin_group_id}; SET @quota_ok=(SELECT COUNT(*) FROM \`${CR_GROUP_TABLE}\` WHERE id=${admin_group_id} AND max_storage=${quota_bytes});"
+            fi
+            if ! update_result="$(cloudreve_mysql_query "START TRANSACTION; UPDATE \`${CR_USER_TABLE}\` SET email=${email_sql},nick=${nick_sql},password=${hash_sql},updated_at=NOW() WHERE id=${admin_id} AND group_id=1; SET @admin_rows=ROW_COUNT(); ${quota_sql} SELECT CONCAT(@admin_rows,':',@quota_ok); COMMIT;")"; then
                 die "Cloudreve administrator update failed; backup: $backup_path"
             fi
-            [ "$update_result" = "1" ] || die "Cloudreve administrator record was not updated; backup: $backup_path"
+            [ "$update_result" = "1:1" ] || die "Cloudreve administrator or quota was not updated; backup: $backup_path"
             ;;
         sqlite|sqlite3)
             backup_path="${CLOUDREVE_BACKUP_DIR}/$(basename "$CR_DB_FILE").${timestamp}"
             cp -a "$CR_DB_FILE" "$backup_path"
             chmod 600 "$backup_path"
-            cloudreve_sqlite_update_admin "$admin_id" "$CLOUDREVE_ADMIN_EMAIL" "$CLOUDREVE_ADMIN_NICK" "$password_hash" \
+            cloudreve_sqlite_update_admin "$admin_id" "$CLOUDREVE_ADMIN_EMAIL" "$CLOUDREVE_ADMIN_NICK" "$password_hash" "$admin_group_id" "$quota_bytes" \
                 || die "Cloudreve administrator update failed; backup: $backup_path"
             ;;
     esac
@@ -893,6 +967,7 @@ run_cloudreve_admin() {
     log "[OK] Cloudreve 管理员账号和密码修改成功"
     log "管理员邮箱: $CLOUDREVE_ADMIN_EMAIL"
     log "管理员昵称: $CLOUDREVE_ADMIN_NICK"
+    [ -z "$quota_bytes" ] || log "管理员容量: $quota_label"
     log "数据库备份: $backup_path"
 }
 

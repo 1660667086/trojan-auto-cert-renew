@@ -280,7 +280,7 @@ DISABLE_ACME_CRON=0 ./trojan-auto-cert-renew --install
 /usr/local/sbin/trojan-auto-cert-renew --cloudreve-admin
 ```
 
-脚本会自动查找 Cloudreve 的 systemd 工作目录和 `conf.ini`，显示检测到的管理员，然后依次询问新的登录邮箱、昵称和密码。密码输入不会显示，并且需要输入两次确认。
+脚本会自动查找 Cloudreve 的 systemd 工作目录和 `conf.ini`，显示检测到的管理员，然后依次询问新的登录邮箱、昵称和密码。密码输入不会显示，并且需要输入两次确认。修改成功时，`Admin` 用户组容量默认会设置为 Cloudreve 所在文件系统的总容量，不再保留 Cloudreve 初始的 `1GB` 配额。
 
 目前这个入口支持 Cloudreve v3 的 MySQL/MariaDB 和 SQLite 数据库。它会按 Cloudreve v3 的官方密码格式生成随机盐和摘要；修改前会把数据库备份到：
 
@@ -289,6 +289,19 @@ DISABLE_ACME_CRON=0 ./trojan-auto-cert-renew --install
 ```
 
 修改成功后会重启并检查 Cloudreve 服务。无法确认版本、管理员记录或数据库结构时会停止，不会直接改库。
+
+默认容量行为可以覆盖。保留原容量，或明确指定容量（单位 GiB）：
+
+```bash
+CLOUDREVE_ADMIN_STORAGE_GB=keep /usr/local/sbin/trojan-auto-cert-renew --cloudreve-admin
+CLOUDREVE_ADMIN_STORAGE_GB=10 /usr/local/sbin/trojan-auto-cert-renew --cloudreve-admin
+```
+
+如果 Cloudreve 文件存储位于单独挂载的磁盘，请指定该目录，脚本会使用对应文件系统的总容量：
+
+```bash
+CLOUDREVE_STORAGE_PATH=/data/cloudreve /usr/local/sbin/trojan-auto-cert-renew --cloudreve-admin
+```
 
 ## 卸载
 
