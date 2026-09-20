@@ -19,6 +19,7 @@ DISABLE_ACME_CRON="${DISABLE_ACME_CRON:-1}"
 SERVICE_STOP_LIST="${SERVICE_STOP_LIST:-trojan trojan-go trojan-web nginx caddy apache2 httpd cloudreve}"
 ALWAYS_START_TROJAN="${ALWAYS_START_TROJAN:-1}"
 DISPLAY_TZ="${DISPLAY_TZ:-Asia/Shanghai}"
+PORT_RELEASE_WAIT="${PORT_RELEASE_WAIT:-20}"
 CHECK_MINUTE="${CHECK_MINUTE:-17}"
 CHECK_HOUR="${CHECK_HOUR:-4}"
 DAILY_RESTART="${DAILY_RESTART:-1}"
@@ -257,6 +258,14 @@ install_packages() {
 
     if ! has_cmd python3 && ! has_cmd python; then
         packages+=(python3)
+    fi
+
+    if ! has_cmd crontab; then
+        if has_cmd apt-get; then
+            packages+=(cron)
+        else
+            packages+=(cronie)
+        fi
     fi
 
     [ "${#packages[@]}" -eq 0 ] && return 0
@@ -858,6 +867,18 @@ disable_acme_cron() {
 restore_services() {
     local i svc
 
+    if [ "$TROJAN_WEB_WAS_ACTIVE" != "1" ] \
+        && service_exists trojan-web \
+        && service_active trojan-web; then
+        log "Stopping trojan-web because it was inactive before renewal"
+        systemctl stop trojan-web || true
+    fi
+
+    if ! wait_for_port80_free "$PORT_RELEASE_WAIT"; then
+        log "[WARN] 端口 80 在等待 ${PORT_RELEASE_WAIT} 秒后仍被占用，继续尝试恢复服务"
+        port80_listeners || true
+    fi
+
     if [ "$STARTED_SERVICES_COUNT" -gt 0 ]; then
         log "Restoring services..."
         for ((i=STARTED_SERVICES_COUNT-1; i>=0; i--)); do
@@ -865,13 +886,6 @@ restore_services() {
             log "Starting $svc"
             systemctl start "$svc" || true
         done
-    fi
-
-    if [ "$TROJAN_WEB_WAS_ACTIVE" != "1" ] \
-        && service_exists trojan-web \
-        && service_active trojan-web; then
-        log "Stopping trojan-web because it was inactive before renewal"
-        systemctl stop trojan-web || true
     fi
 
     if [ "$ALWAYS_START_TROJAN" = "1" ]; then
@@ -998,6 +1012,21 @@ check_port80_free() {
         printf '%s\n' "$listeners"
         return 1
     fi
+    return 0
+}
+
+wait_for_port80_free() {
+    local timeout="$1"
+    local elapsed=0
+
+    while ! check_port80_free >/dev/null 2>&1; do
+        if [ "$elapsed" -eq 0 ]; then
+            log "等待证书验证进程释放端口 80..."
+        fi
+        [ "$elapsed" -lt "$timeout" ] || return 1
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
     return 0
 }
 
