@@ -109,6 +109,45 @@ manual_domain_output="$(DOMAIN=manual.example.com "$SCRIPT" --force)"
 grep -Fq '[OK] 已将域名写入 Trojan 配置 ssl.sni: manual.example.com' <<<"$manual_domain_output"
 python3 -c 'import json, sys; assert json.load(open(sys.argv[1]))["ssl"]["sni"] == "manual.example.com"' "$CONFIG"
 
+CLOUDREVE_CONFIG_FILE="${TMP_DIR}/cloudreve-conf.ini"
+CLOUDREVE_DB="${TMP_DIR}/cloudreve.db"
+CLOUDREVE_BACKUPS="${TMP_DIR}/cloudreve-admin-backups"
+cat > "$CLOUDREVE_CONFIG_FILE" <<EOF
+[Database]
+Type = sqlite
+DBFile = $CLOUDREVE_DB
+TablePrefix = cd_
+EOF
+python3 - "$CLOUDREVE_DB" <<'PY'
+import sqlite3
+import sys
+
+db = sqlite3.connect(sys.argv[1])
+db.execute("CREATE TABLE cd_users (id INTEGER PRIMARY KEY, email TEXT UNIQUE, nick TEXT, password TEXT, status INTEGER, group_id INTEGER, deleted_at TEXT, updated_at TEXT)")
+db.execute("INSERT INTO cd_users VALUES (1, 'admin@cloudreve.org', 'admin', '1234567890abcdef:0000000000000000000000000000000000000000', 0, 1, NULL, CURRENT_TIMESTAMP)")
+db.commit()
+db.close()
+PY
+cloudreve_output="$(CLOUDREVE_CONFIG="$CLOUDREVE_CONFIG_FILE" \
+    CLOUDREVE_ADMIN_EMAIL=owner@example.com CLOUDREVE_ADMIN_NICK=owner \
+    CLOUDREVE_ADMIN_PASSWORD=SecurePass123 CLOUDREVE_BACKUP_DIR="$CLOUDREVE_BACKUPS" \
+    "$SCRIPT" --cloudreve-admin)"
+grep -Fq '[OK] Cloudreve 管理员账号和密码修改成功' <<<"$cloudreve_output"
+python3 - "$CLOUDREVE_DB" <<'PY'
+import hashlib
+import sqlite3
+import sys
+
+db = sqlite3.connect(sys.argv[1])
+email, nick, stored = db.execute("SELECT email,nick,password FROM cd_users WHERE id=1").fetchone()
+salt, digest = stored.split(":", 1)
+assert email == "owner@example.com"
+assert nick == "owner"
+assert len(salt) == 16
+assert hashlib.sha1(("SecurePass123" + salt).encode()).hexdigest() == digest
+PY
+[ "$(find "$CLOUDREVE_BACKUPS" -type f | wc -l | tr -d ' ')" = "1" ]
+
 INSTALLED_SCRIPT="${TMP_DIR}/installed/trojan-auto-cert-renew"
 CRON_FILE="${TMP_DIR}/trojan-auto-cert-renew.cron"
 mkdir -p "$(dirname "$INSTALLED_SCRIPT")"

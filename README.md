@@ -43,7 +43,8 @@ curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/m
   2) 手动立即申请：自动识别域名并马上申请、安装
   3) 手动指定域名：输入域名并马上申请、安装
   4) 只查看域名、证书和到期时间
-请选择 [1-4，默认 1]:
+  5) 修改 Cloudreve 管理员账号和密码
+请选择 [1-5，默认 1]:
 ```
 
 菜单只在人工安装时显示。没有交互终端的自动部署会默认选择自动模式；定时任务本身不会弹出菜单，也不会等待输入。
@@ -270,6 +271,24 @@ cloudreve
 ```bash
 DISABLE_ACME_CRON=0 ./trojan-auto-cert-renew --install
 ```
+
+## Cloudreve 管理员
+
+安装时可以选择菜单第 `5` 项。安装后也可以随时运行：
+
+```bash
+/usr/local/sbin/trojan-auto-cert-renew --cloudreve-admin
+```
+
+脚本会自动查找 Cloudreve 的 systemd 工作目录和 `conf.ini`，显示检测到的管理员，然后依次询问新的登录邮箱、昵称和密码。密码输入不会显示，并且需要输入两次确认。
+
+目前这个入口支持 Cloudreve v3 的 MySQL/MariaDB 和 SQLite 数据库。它会按 Cloudreve v3 的官方密码格式生成随机盐和摘要；修改前会把数据库备份到：
+
+```text
+/root/cloudreve-admin-backups/
+```
+
+修改成功后会重启并检查 Cloudreve 服务。无法确认版本、管理员记录或数据库结构时会停止，不会直接改库。
 
 ## 卸载
 

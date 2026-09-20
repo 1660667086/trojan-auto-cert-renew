@@ -30,10 +30,18 @@ INSTALL_ACTION="${INSTALL_ACTION:-ask}"
 MANUAL_DOMAIN="${MANUAL_DOMAIN:-}"
 FIX_APT_ARCHIVE="${FIX_APT_ARCHIVE:-0}"
 PURGE="${PURGE:-0}"
+CLOUDREVE_CONFIG="${CLOUDREVE_CONFIG:-}"
+CLOUDREVE_SERVICE="${CLOUDREVE_SERVICE:-cloudreve}"
+CLOUDREVE_ADMIN_ID="${CLOUDREVE_ADMIN_ID:-}"
+CLOUDREVE_ADMIN_EMAIL="${CLOUDREVE_ADMIN_EMAIL:-}"
+CLOUDREVE_ADMIN_NICK="${CLOUDREVE_ADMIN_NICK:-}"
+CLOUDREVE_ADMIN_PASSWORD="${CLOUDREVE_ADMIN_PASSWORD:-}"
+CLOUDREVE_BACKUP_DIR="${CLOUDREVE_BACKUP_DIR:-/root/cloudreve-admin-backups}"
 DOMAIN_SOURCE=""
 
 INSTALL_MODE=0
 UNINSTALL_MODE=0
+CLOUDREVE_ADMIN_MODE=0
 FORCE=0
 SCHEDULED=0
 DRY_RUN=0
@@ -72,6 +80,7 @@ usage() {
 Usage:
   trojan-auto-cert-renew --install
   trojan-auto-cert-renew --uninstall [--purge]
+  trojan-auto-cert-renew --cloudreve-admin
   trojan-auto-cert-renew
   trojan-auto-cert-renew --scheduled
   trojan-auto-cert-renew [--force] [--dry-run] [--status] [--recover] [--restart]
@@ -80,6 +89,8 @@ Modes:
   --install       Install this script, dependencies and scheduled tasks
   --uninstall     Remove this script and its scheduled tasks
   --purge         With --uninstall, also remove logs and config backups
+  --cloudreve-admin
+                  Change a Cloudreve v3 administrator email, nickname and password
   no argument     Auto-detect the domain and immediately request/install a certificate
   --scheduled     Check expiry first; renew only within RENEW_DAYS (used by cron)
   --force         Immediately request/install a certificate
@@ -102,6 +113,11 @@ Environment variables:
   INSTALL_ACTION=ask
   MANUAL_DOMAIN=www.example.com
   FIX_APT_ARCHIVE=0
+  CLOUDREVE_CONFIG=/path/to/conf.ini
+  CLOUDREVE_SERVICE=cloudreve
+  CLOUDREVE_ADMIN_EMAIL=admin@example.com
+  CLOUDREVE_ADMIN_NICK=admin
+  CLOUDREVE_ADMIN_PASSWORD=change-me
   DISPLAY_TZ=Asia/Shanghai
   SERVICE_STOP_LIST="trojan nginx cloudreve"
   ALWAYS_START_TROJAN=1
@@ -120,6 +136,9 @@ while [ "$#" -gt 0 ]; do
             ;;
         --uninstall|uninstall)
             UNINSTALL_MODE=1
+            ;;
+        --cloudreve-admin|cloudreve-admin)
+            CLOUDREVE_ADMIN_MODE=1
             ;;
         --purge|purge)
             PURGE=1
@@ -165,7 +184,8 @@ if [ "$SCHEDULED" != "1" ] \
     && [ "$RECOVER" != "1" ] \
     && [ "$RESTART" != "1" ] \
     && [ "$INSTALL_MODE" != "1" ] \
-    && [ "$UNINSTALL_MODE" != "1" ]; then
+    && [ "$UNINSTALL_MODE" != "1" ] \
+    && [ "$CLOUDREVE_ADMIN_MODE" != "1" ]; then
     if invoked_by_cron; then
         SCHEDULED=1
     else
@@ -364,7 +384,7 @@ choose_install_action() {
     local choice
 
     case "$INSTALL_ACTION" in
-        automatic|immediate|domain|status)
+        automatic|immediate|domain|status|cloudreve)
             return 0
             ;;
         ask)
@@ -382,12 +402,13 @@ choose_install_action() {
         return 0
     fi
 
-    printf '\n请选择本次证书处理方式：\n' > /dev/tty
+    printf '\n请选择安装后的操作：\n' > /dev/tty
     printf '  1) 自动模式（推荐）：自动识别域名，仅在证书缺失或不足 %s 天时申请\n' "$RENEW_DAYS" > /dev/tty
     printf '  2) 手动立即申请：自动识别域名并马上申请、安装\n' > /dev/tty
     printf '  3) 手动指定域名：输入域名并马上申请、安装\n' > /dev/tty
     printf '  4) 只查看域名、证书和到期时间\n' > /dev/tty
-    printf '请选择 [1-4，默认 1]: ' > /dev/tty
+    printf '  5) 修改 Cloudreve 管理员账号和密码\n' > /dev/tty
+    printf '请选择 [1-5，默认 1]: ' > /dev/tty
     IFS= read -r choice < /dev/tty || choice="1"
 
     case "${choice:-1}" in
@@ -395,6 +416,7 @@ choose_install_action() {
         2) INSTALL_ACTION="immediate" ;;
         3) INSTALL_ACTION="domain" ;;
         4) INSTALL_ACTION="status" ;;
+        5) INSTALL_ACTION="cloudreve" ;;
         *)
             log "[WARN] 选择无效，默认使用自动模式"
             INSTALL_ACTION="automatic"
@@ -429,6 +451,10 @@ run_install_action() {
         status)
             log "已选择只查看状态"
             "$INSTALL_PATH" --status
+            ;;
+        cloudreve)
+            log "已选择修改 Cloudreve 管理员"
+            "$INSTALL_PATH" --cloudreve-admin
             ;;
     esac
 }
@@ -490,6 +516,384 @@ run_uninstaller() {
     log "[OK] 已卸载: $INSTALL_PATH"
     log "[OK] 已删除定时任务: $CRON_FILE"
     log "证书、acme.sh、Trojan 配置和 Trojan 服务均未删除"
+}
+
+cloudreve_ini_get() {
+    local file="$1"
+    local section="$2"
+    local key="$3"
+    local fallback="${4:-}"
+    local python_cmd
+
+    if command -v python3 >/dev/null 2>&1; then
+        python_cmd="python3"
+    elif command -v python >/dev/null 2>&1; then
+        python_cmd="python"
+    else
+        return 1
+    fi
+
+    "$python_cmd" - "$file" "$section" "$key" "$fallback" <<'PY'
+from __future__ import print_function
+import io
+import sys
+try:
+    import configparser
+except ImportError:
+    import ConfigParser as configparser
+
+path, section, key, fallback = sys.argv[1:]
+parser = configparser.RawConfigParser()
+with io.open(path, "r", encoding="utf-8") as f:
+    if hasattr(parser, "read_file"):
+        parser.read_file(f)
+    else:
+        parser.readfp(f)
+value = parser.get(section, key) if parser.has_option(section, key) else fallback
+if len(value) >= 2 and value[0] == "`" and value[-1] == "`":
+    value = value[1:-1]
+print(value)
+PY
+}
+
+detect_cloudreve_config() {
+    local working_dir pid arg expect_config candidate
+
+    if [ -n "$CLOUDREVE_CONFIG" ]; then
+        [ -r "$CLOUDREVE_CONFIG" ] || die "Cloudreve config is not readable: $CLOUDREVE_CONFIG"
+        return 0
+    fi
+
+    working_dir=""
+    if has_cmd systemctl; then
+        working_dir="$(systemctl show "$CLOUDREVE_SERVICE" -p WorkingDirectory --value 2>/dev/null || true)"
+        pid="$(systemctl show "$CLOUDREVE_SERVICE" -p MainPID --value 2>/dev/null || true)"
+        if [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 0 ] && [ -r "/proc/${pid}/cmdline" ]; then
+            expect_config=0
+            while IFS= read -r arg; do
+                if [ "$expect_config" = "1" ]; then
+                    CLOUDREVE_CONFIG="$arg"
+                    break
+                fi
+                case "$arg" in
+                    -c|--conf) expect_config=1 ;;
+                    -c=*) CLOUDREVE_CONFIG="${arg#-c=}"; break ;;
+                    --conf=*) CLOUDREVE_CONFIG="${arg#--conf=}"; break ;;
+                esac
+            done < <(tr '\0' '\n' < "/proc/${pid}/cmdline")
+        fi
+    fi
+
+    if [ -n "$CLOUDREVE_CONFIG" ] && [ -r "$CLOUDREVE_CONFIG" ]; then
+        return 0
+    fi
+    CLOUDREVE_CONFIG=""
+
+    for candidate in \
+        "${working_dir:+${working_dir}/conf.ini}" \
+        "${working_dir:+${working_dir}/data/conf.ini}" \
+        /usr/local/lighthouse/softwares/cloudreve/conf.ini \
+        /usr/local/lighthouse/softwares/cloudreve/data/conf.ini \
+        /usr/local/cloudreve/conf.ini \
+        /usr/local/cloudreve/data/conf.ini \
+        /opt/cloudreve/conf.ini \
+        /opt/cloudreve/data/conf.ini \
+        /root/cloudreve/conf.ini \
+        /root/cloudreve/data/conf.ini \
+        /etc/cloudreve/conf.ini; do
+        [ -n "$candidate" ] || continue
+        if [ -r "$candidate" ] && grep -q '^\[Database\]' "$candidate"; then
+            CLOUDREVE_CONFIG="$candidate"
+            return 0
+        fi
+    done
+
+    die "could not find Cloudreve conf.ini; set CLOUDREVE_CONFIG=/path/to/conf.ini"
+}
+
+cloudreve_hex_decode() {
+    local python_cmd
+    if command -v python3 >/dev/null 2>&1; then
+        python_cmd="python3"
+    else
+        python_cmd="python"
+    fi
+    "$python_cmd" - "$1" <<'PY'
+from __future__ import print_function
+import binascii
+import sys
+value = binascii.unhexlify(sys.argv[1]).decode("utf-8")
+print(value)
+PY
+}
+
+cloudreve_to_hex() {
+    printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n'
+}
+
+cloudreve_password_hash() {
+    local python_cmd
+    if command -v python3 >/dev/null 2>&1; then
+        python_cmd="python3"
+    else
+        python_cmd="python"
+    fi
+    printf '%s' "$1" | "$python_cmd" -c '
+from __future__ import print_function
+import binascii
+import hashlib
+import os
+import sys
+stream = getattr(sys.stdin, "buffer", sys.stdin)
+password = stream.read()
+salt = binascii.hexlify(os.urandom(8))
+if not isinstance(salt, str):
+    salt = salt.decode("ascii")
+digest = hashlib.sha1(password + salt.encode("ascii")).hexdigest()
+print(salt + ":" + digest)
+'
+}
+
+cloudreve_mysql_query() {
+    local sql="$1"
+    local args=(--batch --skip-column-names --raw --default-character-set=utf8mb4)
+
+    if [ "$CR_DB_UNIX_SOCKET" = "1" ]; then
+        args+=(--socket="$CR_DB_HOST")
+    else
+        args+=(--protocol=TCP --host="$CR_DB_HOST" --port="$CR_DB_PORT")
+    fi
+    args+=(--user="$CR_DB_USER")
+    MYSQL_PWD="$CR_DB_PASSWORD" mysql "${args[@]}" "$CR_DB_NAME" --execute "$sql"
+}
+
+cloudreve_mysql_dump() {
+    local destination="$1"
+    local dump_cmd
+    local args=(--single-transaction --skip-lock-tables --default-character-set=utf8mb4)
+
+    if has_cmd mariadb-dump; then
+        dump_cmd="mariadb-dump"
+    elif has_cmd mysqldump; then
+        dump_cmd="mysqldump"
+    else
+        die "missing mariadb-dump/mysqldump; install a MariaDB or MySQL client first"
+    fi
+
+    if [ "$CR_DB_UNIX_SOCKET" = "1" ]; then
+        args+=(--socket="$CR_DB_HOST")
+    else
+        args+=(--protocol=TCP --host="$CR_DB_HOST" --port="$CR_DB_PORT")
+    fi
+    args+=(--user="$CR_DB_USER")
+    MYSQL_PWD="$CR_DB_PASSWORD" "$dump_cmd" "${args[@]}" "$CR_DB_NAME" "$CR_USER_TABLE" > "$destination"
+}
+
+cloudreve_sqlite_admin_row() {
+    local python_cmd
+    if command -v python3 >/dev/null 2>&1; then
+        python_cmd="python3"
+    else
+        python_cmd="python"
+    fi
+    "$python_cmd" - "$CR_DB_FILE" "$CR_USER_TABLE" "$CLOUDREVE_ADMIN_ID" <<'PY'
+from __future__ import print_function
+import binascii
+import sqlite3
+import sys
+
+path, table, admin_id = sys.argv[1:]
+db = sqlite3.connect(path)
+sql = 'SELECT id,email,nick,password FROM "{}" WHERE group_id=1 AND deleted_at IS NULL'.format(table)
+params = []
+if admin_id:
+    sql += " AND id=?"
+    params.append(int(admin_id))
+sql += " ORDER BY id LIMIT 1"
+row = db.execute(sql, params).fetchone()
+if row:
+    email = binascii.hexlify((row[1] or "").encode("utf-8")).decode("ascii")
+    nick = binascii.hexlify((row[2] or "").encode("utf-8")).decode("ascii")
+    print("{}\t{}\t{}\t{}".format(row[0], email, nick, row[3] or ""))
+PY
+}
+
+cloudreve_sqlite_update_admin() {
+    local admin_id="$1"
+    local email="$2"
+    local nick="$3"
+    local password_hash="$4"
+    local python_cmd
+    if command -v python3 >/dev/null 2>&1; then
+        python_cmd="python3"
+    else
+        python_cmd="python"
+    fi
+    "$python_cmd" - "$CR_DB_FILE" "$CR_USER_TABLE" "$admin_id" "$email" "$nick" "$password_hash" <<'PY'
+from __future__ import print_function
+import sqlite3
+import sys
+
+path, table, admin_id, email, nick, password_hash = sys.argv[1:]
+db = sqlite3.connect(path)
+try:
+    cursor = db.execute(
+        'UPDATE "{}" SET email=?, nick=?, password=?, updated_at=CURRENT_TIMESTAMP '
+        'WHERE id=? AND group_id=1'.format(table),
+        (email, nick, password_hash, int(admin_id)),
+    )
+    if cursor.rowcount != 1:
+        raise RuntimeError("administrator record was not updated")
+    db.commit()
+finally:
+    db.close()
+PY
+}
+
+run_cloudreve_admin() {
+    local config_dir admin_row admin_id email_hex nick_hex stored_password
+    local current_email current_nick input password_confirm password_hash
+    local email_value nick_value email_sql nick_sql hash_sql update_result backup_path timestamp
+
+    detect_cloudreve_config
+    log "Detected Cloudreve config: $CLOUDREVE_CONFIG"
+
+    CR_DB_TYPE="$(cloudreve_ini_get "$CLOUDREVE_CONFIG" Database Type sqlite | tr '[:upper:]' '[:lower:]')"
+    CR_DB_HOST="$(cloudreve_ini_get "$CLOUDREVE_CONFIG" Database Host 127.0.0.1)"
+    CR_DB_PORT="$(cloudreve_ini_get "$CLOUDREVE_CONFIG" Database Port 3306)"
+    CR_DB_USER="$(cloudreve_ini_get "$CLOUDREVE_CONFIG" Database User '')"
+    CR_DB_PASSWORD="$(cloudreve_ini_get "$CLOUDREVE_CONFIG" Database Password '')"
+    CR_DB_NAME="$(cloudreve_ini_get "$CLOUDREVE_CONFIG" Database Name cloudreve)"
+    CR_DB_FILE="$(cloudreve_ini_get "$CLOUDREVE_CONFIG" Database DBFile cloudreve.db)"
+    CR_DB_UNIX_SOCKET="$(cloudreve_ini_get "$CLOUDREVE_CONFIG" Database UnixSocket false | tr '[:upper:]' '[:lower:]')"
+    CR_TABLE_PREFIX="$(cloudreve_ini_get "$CLOUDREVE_CONFIG" Database TablePrefix cd_)"
+
+    [[ "$CR_TABLE_PREFIX" =~ ^[A-Za-z0-9_]+$ ]] || die "invalid Cloudreve table prefix"
+    CR_USER_TABLE="${CR_TABLE_PREFIX}users"
+    case "$CR_DB_UNIX_SOCKET" in
+        true|1|yes) CR_DB_UNIX_SOCKET=1 ;;
+        *) CR_DB_UNIX_SOCKET=0 ;;
+    esac
+    if [ -n "$CLOUDREVE_ADMIN_ID" ]; then
+        [[ "$CLOUDREVE_ADMIN_ID" =~ ^[0-9]+$ ]] || die "CLOUDREVE_ADMIN_ID must be numeric"
+    fi
+
+    case "$CR_DB_TYPE" in
+        mysql|mariadb)
+            has_cmd mysql || die "mysql client is required for this Cloudreve database"
+            cloudreve_mysql_query "SELECT 1" >/dev/null || die "could not connect to the Cloudreve database"
+            if [ -n "$CLOUDREVE_ADMIN_ID" ]; then
+                admin_row="$(cloudreve_mysql_query "SELECT id,HEX(email),HEX(nick),password FROM \`${CR_USER_TABLE}\` WHERE group_id=1 AND deleted_at IS NULL AND id=${CLOUDREVE_ADMIN_ID} ORDER BY id LIMIT 1")"
+            else
+                admin_row="$(cloudreve_mysql_query "SELECT id,HEX(email),HEX(nick),password FROM \`${CR_USER_TABLE}\` WHERE group_id=1 AND deleted_at IS NULL ORDER BY id LIMIT 1")"
+            fi
+            ;;
+        sqlite|sqlite3)
+            config_dir="$(cd "$(dirname "$CLOUDREVE_CONFIG")" && pwd)"
+            case "$CR_DB_FILE" in
+                /*) ;;
+                *) CR_DB_FILE="${config_dir}/${CR_DB_FILE}" ;;
+            esac
+            [ -f "$CR_DB_FILE" ] || die "Cloudreve SQLite database not found: $CR_DB_FILE"
+            admin_row="$(cloudreve_sqlite_admin_row)"
+            ;;
+        *)
+            die "Cloudreve database type '$CR_DB_TYPE' is not supported by this administrator tool"
+            ;;
+    esac
+
+    [ -n "$admin_row" ] || die "no active Cloudreve v3 administrator was found"
+    IFS=$'\t' read -r admin_id email_hex nick_hex stored_password <<< "$admin_row"
+    case "$stored_password" in
+        *:*) ;;
+        *) die "unsupported Cloudreve password format; this entry currently supports Cloudreve v3" ;;
+    esac
+    current_email="$(cloudreve_hex_decode "$email_hex")"
+    current_nick="$(cloudreve_hex_decode "$nick_hex")"
+    log "Detected Cloudreve administrator: ID=$admin_id, email=$current_email, nick=$current_nick"
+
+    if [ -z "$CLOUDREVE_ADMIN_EMAIL" ]; then
+        if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+            printf '新管理员登录邮箱 [%s]: ' "$current_email" > /dev/tty
+            IFS= read -r input < /dev/tty || input=""
+            CLOUDREVE_ADMIN_EMAIL="${input:-$current_email}"
+        else
+            CLOUDREVE_ADMIN_EMAIL="$current_email"
+        fi
+    fi
+    if [ -z "$CLOUDREVE_ADMIN_NICK" ]; then
+        if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+            printf '新管理员昵称 [%s]: ' "$current_nick" > /dev/tty
+            IFS= read -r input < /dev/tty || input=""
+            CLOUDREVE_ADMIN_NICK="${input:-$current_nick}"
+        else
+            CLOUDREVE_ADMIN_NICK="$current_nick"
+        fi
+    fi
+    if [ -z "$CLOUDREVE_ADMIN_PASSWORD" ]; then
+        [ -r /dev/tty ] && [ -w /dev/tty ] \
+            || die "no interactive terminal; set CLOUDREVE_ADMIN_PASSWORD"
+        printf '新管理员密码（输入时不显示）: ' > /dev/tty
+        IFS= read -r -s CLOUDREVE_ADMIN_PASSWORD < /dev/tty || CLOUDREVE_ADMIN_PASSWORD=""
+        printf '\n再次输入新密码: ' > /dev/tty
+        IFS= read -r -s password_confirm < /dev/tty || password_confirm=""
+        printf '\n' > /dev/tty
+        [ "$CLOUDREVE_ADMIN_PASSWORD" = "$password_confirm" ] || die "the two passwords do not match"
+    fi
+
+    [[ "$CLOUDREVE_ADMIN_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] \
+        || die "invalid administrator email"
+    [ -n "$CLOUDREVE_ADMIN_NICK" ] && [ "${#CLOUDREVE_ADMIN_NICK}" -le 50 ] \
+        || die "administrator nickname must contain 1-50 characters"
+    [ "${#CLOUDREVE_ADMIN_EMAIL}" -le 100 ] || die "administrator email is too long"
+    [ "${#CLOUDREVE_ADMIN_PASSWORD}" -ge 6 ] && [ "${#CLOUDREVE_ADMIN_PASSWORD}" -le 128 ] \
+        || die "administrator password must contain 6-128 characters"
+
+    password_hash="$(cloudreve_password_hash "$CLOUDREVE_ADMIN_PASSWORD")"
+    [[ "$password_hash" =~ ^[0-9a-fA-F]{16}:[0-9a-fA-F]{40}$ ]] \
+        || die "could not generate the Cloudreve password hash"
+
+    mkdir -p "$CLOUDREVE_BACKUP_DIR"
+    chmod 700 "$CLOUDREVE_BACKUP_DIR"
+    timestamp="$(date '+%Y%m%d%H%M%S')"
+    case "$CR_DB_TYPE" in
+        mysql|mariadb)
+            backup_path="${CLOUDREVE_BACKUP_DIR}/${CR_DB_NAME}-${CR_USER_TABLE}.${timestamp}.sql"
+            cloudreve_mysql_dump "$backup_path" || die "Cloudreve database backup failed"
+            chmod 600 "$backup_path"
+            email_value="$(cloudreve_to_hex "$CLOUDREVE_ADMIN_EMAIL")"
+            nick_value="$(cloudreve_to_hex "$CLOUDREVE_ADMIN_NICK")"
+            email_sql="CONVERT(0x${email_value} USING utf8mb4)"
+            nick_sql="CONVERT(0x${nick_value} USING utf8mb4)"
+            hash_sql="0x$(cloudreve_to_hex "$password_hash")"
+            if ! update_result="$(cloudreve_mysql_query "UPDATE \`${CR_USER_TABLE}\` SET email=${email_sql},nick=${nick_sql},password=${hash_sql},updated_at=NOW() WHERE id=${admin_id} AND group_id=1; SELECT ROW_COUNT();")"; then
+                die "Cloudreve administrator update failed; backup: $backup_path"
+            fi
+            [ "$update_result" = "1" ] || die "Cloudreve administrator record was not updated; backup: $backup_path"
+            ;;
+        sqlite|sqlite3)
+            backup_path="${CLOUDREVE_BACKUP_DIR}/$(basename "$CR_DB_FILE").${timestamp}"
+            cp -a "$CR_DB_FILE" "$backup_path"
+            chmod 600 "$backup_path"
+            cloudreve_sqlite_update_admin "$admin_id" "$CLOUDREVE_ADMIN_EMAIL" "$CLOUDREVE_ADMIN_NICK" "$password_hash" \
+                || die "Cloudreve administrator update failed; backup: $backup_path"
+            ;;
+    esac
+
+    CLOUDREVE_ADMIN_PASSWORD=""
+    if service_exists "$CLOUDREVE_SERVICE"; then
+        systemctl restart "$CLOUDREVE_SERVICE" || die "administrator updated, but Cloudreve restart failed; backup: $backup_path"
+        sleep 2
+        service_active "$CLOUDREVE_SERVICE" \
+            || die "administrator updated, but Cloudreve is not running; backup: $backup_path"
+    else
+        log "[WARN] Cloudreve systemd service was not found; restart Cloudreve manually"
+    fi
+
+    log "[OK] Cloudreve 管理员账号和密码修改成功"
+    log "管理员邮箱: $CLOUDREVE_ADMIN_EMAIL"
+    log "管理员昵称: $CLOUDREVE_ADMIN_NICK"
+    log "数据库备份: $backup_path"
 }
 
 json_get() {
@@ -1108,6 +1512,11 @@ EXP
 main() {
     need_root
 
+    if [ "$CLOUDREVE_ADMIN_MODE" = "1" ] \
+        && { [ "$INSTALL_MODE" = "1" ] || [ "$UNINSTALL_MODE" = "1" ]; }; then
+        die "--cloudreve-admin cannot be combined with --install or --uninstall"
+    fi
+
     if [ "$INSTALL_MODE" = "1" ] && [ "$UNINSTALL_MODE" = "1" ]; then
         die "--install and --uninstall cannot be used together"
     fi
@@ -1119,6 +1528,11 @@ main() {
 
     if [ "$UNINSTALL_MODE" = "1" ]; then
         run_uninstaller
+        exit $?
+    fi
+
+    if [ "$CLOUDREVE_ADMIN_MODE" = "1" ]; then
+        run_cloudreve_admin
         exit $?
     fi
 
