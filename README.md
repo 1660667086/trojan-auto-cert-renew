@@ -2,6 +2,7 @@
 
 这个仓库把 Trojan 自带的 `trojan tls` 证书申请工具包了一层自动化：
 
+- 安装、申请、续签、状态检查、重启和卸载全部由一个脚本完成
 - 每台服务器自动识别自己的 Trojan 域名，不需要把域名写死在脚本里
 - 定时任务只在证书不足 15 天时续签，避免重复申请触发 CA 限额
 - 人工直接运行脚本时立即申请并安装，不等待到期
@@ -20,14 +21,16 @@
 ```bash
 git clone https://github.com/1660667086/trojan-auto-cert-renew.git
 cd trojan-auto-cert-renew
-bash install.sh
+./trojan-auto-cert-renew --install
 ```
 
-也可以直接运行 raw 安装入口：
+也可以只拉取并运行这一个主脚本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/trojan-auto-cert-renew | bash -s -- --install
 ```
+
+仓库里的 `install.sh` 和 `uninstall.sh` 仅作为旧命令兼容入口，实际都会转到同一个主脚本。
 
 安装完成后会显示选择菜单，直接按回车默认使用自动模式：
 
@@ -46,7 +49,7 @@ curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/m
 
 ```bash
 cd trojan-auto-cert-renew
-bash install.sh
+./trojan-auto-cert-renew --install
 ```
 
 安装后会生成：
@@ -145,50 +148,50 @@ Trojan 服务: trojan (运行中)
 修改定时任务的提前续签天数：
 
 ```bash
-RENEW_DAYS=15 bash install.sh
+RENEW_DAYS=15 ./trojan-auto-cert-renew --install
 ```
 
 修改每天重启 Trojan 的时间：
 
 ```bash
-RESTART_HOUR=4 RESTART_MINUTE=47 bash install.sh
+RESTART_HOUR=4 RESTART_MINUTE=47 ./trojan-auto-cert-renew --install
 ```
 
 如果不需要每日重启，可以关闭：
 
 ```bash
-DAILY_RESTART=0 bash install.sh
+DAILY_RESTART=0 ./trojan-auto-cert-renew --install
 ```
 
 自动化安装时也可以跳过菜单，直接指定本次操作：
 
 ```bash
 # 自动检查，到期才申请
-curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/install.sh | INSTALL_ACTION=automatic bash
+curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/trojan-auto-cert-renew | INSTALL_ACTION=automatic bash -s -- --install
 
 # 自动识别域名并立即申请
-curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/install.sh | INSTALL_ACTION=immediate bash
+curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/trojan-auto-cert-renew | INSTALL_ACTION=immediate bash -s -- --install
 
 # 指定域名并立即申请
-curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/install.sh | INSTALL_ACTION=domain MANUAL_DOMAIN=www.example.com bash
+curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/trojan-auto-cert-renew | INSTALL_ACTION=domain MANUAL_DOMAIN=www.example.com bash -s -- --install
 ```
 
 指定域名和配置文件：
 
 ```bash
-DOMAIN=www.example.com CONFIG_PATH=/usr/local/etc/trojan/config.json bash install.sh
+DOMAIN=www.example.com CONFIG_PATH=/usr/local/etc/trojan/config.json ./trojan-auto-cert-renew --install
 ```
 
 只管理 Trojan 服务：
 
 ```bash
-SERVICE_STOP_LIST="trojan" bash install.sh
+SERVICE_STOP_LIST="trojan" ./trojan-auto-cert-renew --install
 ```
 
 如果你的服务名不是 `trojan` 或 `trojan-go`，安装时指定：
 
 ```bash
-TROJAN_SERVICE=你的服务名 bash install.sh
+TROJAN_SERVICE=你的服务名 ./trojan-auto-cert-renew --install
 ```
 
 正常情况下不要传 `DOMAIN`，让每台服务器自动识别自己的域名。安装时明确传入的 `DOMAIN`、`CONFIG_PATH`、`TROJAN_CLI`、`TROJAN_SERVICE`、`SERVICE_STOP_LIST`、`RENEW_DAYS` 以及重启时间会写入定时任务。后面要修改，可以编辑：
@@ -206,7 +209,7 @@ TROJAN_SERVICE=你的服务名 bash install.sh
 需要改时区可以安装时指定：
 
 ```bash
-DISPLAY_TZ=Asia/Shanghai bash install.sh
+DISPLAY_TZ=Asia/Shanghai ./trojan-auto-cert-renew --install
 ```
 
 ## 自动识别规则
@@ -262,19 +265,19 @@ cloudreve
 安装脚本默认会移除 `acme.sh` 自己添加的 cron 续签任务，因为那个任务不会先停端口，容易续签失败。需要保留的话：
 
 ```bash
-DISABLE_ACME_CRON=0 bash install.sh
+DISABLE_ACME_CRON=0 ./trojan-auto-cert-renew --install
 ```
 
 ## 卸载
 
 ```bash
-bash uninstall.sh
+./trojan-auto-cert-renew --uninstall
 ```
 
 或者直接运行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/trojan-auto-cert-renew | bash -s -- --uninstall
 ```
 
 默认只删除自动续签脚本和定时任务，不删除证书、`acme.sh`、Trojan 配置、Trojan 服务。
@@ -282,7 +285,7 @@ curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/m
 连日志和脚本备份一起清理：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/uninstall.sh | PURGE=1 bash
+curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/trojan-auto-cert-renew | bash -s -- --uninstall --purge
 ```
 
 ## Debian 10 源过期
@@ -293,10 +296,10 @@ curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/m
 The repository 'http://mirrors.cloud.aliyuncs.com/debian buster Release' no longer has a Release file
 ```
 
-说明这台机器是 Debian 10 `buster`，普通镜像源已经过期。可以让安装器先备份并切换到 Debian 官方归档源：
+说明这台机器是 Debian 10 `buster`，普通镜像源已经过期。一体化安装器会在更新失败后自动识别系统、备份旧源并切换到 Debian 官方归档源，无需再增加参数。也可以显式强制启用：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/install.sh | FIX_APT_ARCHIVE=1 bash
+curl -fsSL https://raw.githubusercontent.com/1660667086/trojan-auto-cert-renew/main/trojan-auto-cert-renew | FIX_APT_ARCHIVE=1 bash -s -- --install
 ```
 
 原 apt 源会备份到：

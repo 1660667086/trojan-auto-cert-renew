@@ -112,12 +112,40 @@ rm -f "$EXPECT_MARKER"
 install_output="$(INSTALL_PATH="$INSTALLED_SCRIPT" CRON_FILE="$CRON_FILE" \
     RUN_CHECK=1 INSTALL_ACTION=automatic \
     CHECK_HOUR=4 CHECK_MINUTE=17 RESTART_HOUR=4 RESTART_MINUTE=47 \
-    "$ROOT_DIR/install.sh")"
+    "$SCRIPT" --install)"
 grep -Fq '[OK] 已选择自动模式' <<<"$install_output"
+grep -Fq '[OK] 一体化脚本安装完成' <<<"$install_output"
 [ ! -e "$EXPECT_MARKER" ]
 grep -Fq '17 4 * * * root ' "$CRON_FILE"
 grep -Fq -- "$INSTALLED_SCRIPT --scheduled" "$CRON_FILE"
 grep -Fq '47 4 * * * root ' "$CRON_FILE"
 grep -Fq -- "$INSTALLED_SCRIPT --restart" "$CRON_FILE"
+
+PIPE_INSTALLED_SCRIPT="${TMP_DIR}/pipe-installed/trojan-auto-cert-renew"
+PIPE_CRON_FILE="${TMP_DIR}/pipe-install.cron"
+pipe_install_output="$(cat "$SCRIPT" | \
+    RAW_BASE="file://${ROOT_DIR}" INSTALL_PATH="$PIPE_INSTALLED_SCRIPT" \
+    CRON_FILE="$PIPE_CRON_FILE" RUN_CHECK=0 bash -s -- --install)"
+grep -Fq '[OK] 一体化脚本安装完成' <<<"$pipe_install_output"
+cmp -s "$SCRIPT" "$PIPE_INSTALLED_SCRIPT"
+grep -Fq -- "$PIPE_INSTALLED_SCRIPT --scheduled" "$PIPE_CRON_FILE"
+
+UNINSTALL_LOG="${TMP_DIR}/uninstall.log"
+UNINSTALL_BACKUPS="${TMP_DIR}/uninstall-backups"
+mkdir -p "$UNINSTALL_BACKUPS"
+touch "$UNINSTALL_LOG" "${UNINSTALL_BACKUPS}/config.json.test"
+uninstall_output="$(INSTALL_PATH="$INSTALLED_SCRIPT" CRON_FILE="$CRON_FILE" \
+    LOG_FILE="$UNINSTALL_LOG" BACKUP_DIR="$UNINSTALL_BACKUPS" \
+    "$SCRIPT" --uninstall --purge)"
+grep -Fq '[OK] 已卸载' <<<"$uninstall_output"
+[ ! -e "$INSTALLED_SCRIPT" ]
+[ ! -e "$CRON_FILE" ]
+[ ! -e "$UNINSTALL_LOG" ]
+[ ! -e "$UNINSTALL_BACKUPS" ]
+
+INSTALL_PATH="$PIPE_INSTALLED_SCRIPT" CRON_FILE="$PIPE_CRON_FILE" \
+    "$SCRIPT" --uninstall >/dev/null
+[ ! -e "$PIPE_INSTALLED_SCRIPT" ]
+[ ! -e "$PIPE_CRON_FILE" ]
 
 echo 'All mode and auto-domain tests passed.'
